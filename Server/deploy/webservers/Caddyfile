@@ -1,0 +1,25 @@
+# ==============================================================================
+# Caddy 2 Configuration for Separated Frontend (UI/dist) + Backend (lg-server)
+# File Path on Debian 13 / Ubuntu 24.04+: /etc/caddy/Caddyfile
+# Note: The Admin Portal URL path (e.g. /admin, /console, etc.) is controlled
+#       directly by `admin_path` in /etc/lg-for-bgp/config.yaml.
+# ==============================================================================
+
+:80 {
+    encode zstd gzip
+
+    # 1. Reverse proxy all /api/* requests to the Go backend daemon
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8080 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+
+    # 2. Serve separated static Frontend (UI/dist) with SPA fallback
+    handle {
+        root * /var/www/lg-for-bgp/ui/dist
+        try_files {path} /index.html
+        file_server
+    }
+}

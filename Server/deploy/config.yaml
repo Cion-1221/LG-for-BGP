@@ -1,0 +1,40 @@
+# ==============================================================================
+# LG-for-BGP Backend Configuration File (config.yaml)
+# Default Path on Linux: /etc/lg-for-bgp/config.yaml or /opt/lg-for-bgp/config.yaml
+# ==============================================================================
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+  # Administrator Backend Portal Path (e.g. "/admin", "/console", "/mgr-portal")
+  admin_path: "/console"
+  trusted_proxies:
+    - "127.0.0.1"
+    - "::1"
+
+database:
+  host: "127.0.0.1"
+  port: 3306
+  user: "lg_user"
+  password: "ChangeMe_StrongDBPass_2026!"
+  dbname: "lg_for_bgp"
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime_minutes: 30
+  conn_max_idle_time_minutes: 5
+
+jwt:
+  # Replace with a newly generated random secret key in production (e.g. `openssl rand -hex 32`)
+  secret: "ChangeMe_LG_For_BGP_JWT_Secret_Key_2026"
+  refresh_token_days: 3
+
+log:
+  dir: "./logs"
+  filename: "lg-server"
+  max_age_days: 14
+  max_backups: 14
+  compress: true
+  level: "info"
+  format: "json"
+  stdout: true
+  access_log: true

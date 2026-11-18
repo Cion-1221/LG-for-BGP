@@ -1,0 +1,22 @@
+# Compiled Binaries
+Server/lg-server
+Server/lg-server.exe
+Server/lg-server-*
+*.exe
+*.out
+
+# Runtime State, Logs & Local Configs
+Server/data/
+Server/logs/
+logs/
+*.log
+*.db
+*.sqlite
+
+# Frontend Dependencies & Build Output
+UI/node_modules/
+UI/dist/
+.env
+.env.local
+.DS_Store
+Thumbs.db

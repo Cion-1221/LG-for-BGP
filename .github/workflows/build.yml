@@ -1,0 +1,162 @@
+name: Build & Package BGP Looking Glass
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: build-and-release
+  cancel-in-progress: false
+
+jobs:
+  build-backend:
+    name: Test & Build Go Backend (Server)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: Server
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go (Latest Stable)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'Server/go.mod'
+          check-latest: true
+          cache-dependency-path: Server/go.sum
+
+      - name: Run Security & Unit Tests
+        run: go test -v ./...
+
+      - name: Build Linux amd64 Static Binary
+        run: |
+          mkdir -p ../dist-artifacts
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ../dist-artifacts/lg-server-linux-amd64 ./cmd/lg-server
+
+      - name: Build Linux arm64 Static Binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o ../dist-artifacts/lg-server-linux-arm64 ./cmd/lg-server
+
+      - name: Upload Backend Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: lg-server-binaries
+          path: dist-artifacts/*
+
+  build-frontend:
+    name: Build React Frontend (UI)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: UI
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js (Latest LTS 22)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies & Build UI
+        run: |
+          npm install
+          npm run build
+
+      - name: Upload Frontend Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: lg-ui-dist
+          path: UI/dist/
+
+  package-release:
+    name: Package Full Deployment Bundle
+    needs: [build-backend, build-frontend]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Backend Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: lg-server-binaries
+          path: build-out/bin
+
+      - name: Download Frontend Build
+        uses: actions/download-artifact@v4
+        with:
+          name: lg-ui-dist
+          path: build-out/ui/dist
+
+      - name: Assemble Release Bundles
+        run: |
+          mkdir -p release-pkg/lg-for-bgp-linux-amd64/ui
+          cp build-out/bin/lg-server-linux-amd64 release-pkg/lg-for-bgp-linux-amd64/lg-server
+          chmod +x release-pkg/lg-for-bgp-linux-amd64/lg-server
+          cp Server/config.yaml release-pkg/lg-for-bgp-linux-amd64/config.yaml
+          cp -r build-out/ui/dist release-pkg/lg-for-bgp-linux-amd64/ui/
+          cp -r Server/deploy release-pkg/lg-for-bgp-linux-amd64/
+          chmod +x release-pkg/lg-for-bgp-linux-amd64/deploy/install-debian13-ubuntu24.sh
+          cp README.md README.zh-CN.md release-pkg/lg-for-bgp-linux-amd64/
+
+          tar -czf release-pkg/lg-for-bgp-linux-amd64.tar.gz -C release-pkg lg-for-bgp-linux-amd64
+
+          mkdir -p release-pkg/lg-for-bgp-linux-arm64/ui
+          cp build-out/bin/lg-server-linux-arm64 release-pkg/lg-for-bgp-linux-arm64/lg-server
+          chmod +x release-pkg/lg-for-bgp-linux-arm64/lg-server
+          cp Server/config.yaml release-pkg/lg-for-bgp-linux-arm64/config.yaml
+          cp -r build-out/ui/dist release-pkg/lg-for-bgp-linux-arm64/ui/
+          cp -r Server/deploy release-pkg/lg-for-bgp-linux-arm64/
+          chmod +x release-pkg/lg-for-bgp-linux-arm64/deploy/install-debian13-ubuntu24.sh
+          cp README.md README.zh-CN.md release-pkg/lg-for-bgp-linux-arm64/
+
+          tar -czf release-pkg/lg-for-bgp-linux-arm64.tar.gz -C release-pkg lg-for-bgp-linux-arm64
+
+      - name: Upload Combined Deployment Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lg-for-bgp-deployment-bundles
+          path: |
+            release-pkg/lg-for-bgp-linux-amd64.tar.gz
+            release-pkg/lg-for-bgp-linux-arm64.tar.gz
+
+      - name: Purge Historical Releases, Tags & Workflow Runs
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_TAG="v1.0.0"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TARGET_TAG="${{ github.ref_name }}"
+          fi
+
+          # 1. Remove any existing release with the same target tag (and any legacy v1.0.1..v1.2.1 releases) before publishing fresh assets
+          for rel_id in $(gh api "repos/${{ github.repository }}/releases?per_page=100" -q ".[] | select(.tag_name == \"${TARGET_TAG}\" or (.tag_name != \"v1.0.0\" and .tag_name != \"${TARGET_TAG}\")) | .id" 2>/dev/null || true); do
+            gh api -X DELETE "repos/${{ github.repository }}/releases/${rel_id}" || true
+          done
+
+          # 2. Delete all completed historical Actions workflow runs from previous commits
+          for run_id in $(gh api "repos/${{ github.repository }}/actions/runs?per_page=100" -q '.workflow_runs[] | select(.head_sha != "${{ github.sha }}" and .status == "completed") | .id' 2>/dev/null || true); do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/runs/${run_id}" || true
+          done
+
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v1.0.0' }}
+          name: "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v1.0.0' }} — Official Release"
+          files: |
+            release-pkg/lg-for-bgp-linux-amd64.tar.gz
+            release-pkg/lg-for-bgp-linux-arm64.tar.gz
+          generate_release_notes: true
