@@ -59,7 +59,18 @@ func (m *mockGoBGPServer) ListPath(req *apipb.ListPathRequest, stream apipb.Gobg
 	}
 
 	rdObj, _ := bgp.ParseRouteDistinguisher(m.rdStr)
-	nlri := bgp.NewLabeledVPNIPAddrPrefix(18, "202.96.128.0", *bgp.NewMPLSLabelStack(0), rdObj)
+	var nlri bgp.AddrPrefixInterface
+	var nhAttr bgp.PathAttributeInterface
+	var destPrefix string
+	if req.GetFamily().GetAfi() == apipb.Family_AFI_IP6 {
+		nlri = bgp.NewLabeledVPNIPv6AddrPrefix(32, "240e:100::", *bgp.NewMPLSLabelStack(0), rdObj)
+		nhAttr = bgp.NewPathAttributeMpReachNLRI("2001:db8::1", []bgp.AddrPrefixInterface{nlri})
+		destPrefix = m.rdStr + ":240e:100::/32"
+	} else {
+		nlri = bgp.NewLabeledVPNIPAddrPrefix(18, "202.96.128.0", *bgp.NewMPLSLabelStack(0), rdObj)
+		nhAttr = bgp.NewPathAttributeNextHop("172.31.255.10")
+		destPrefix = m.rdStr + ":202.96.128.0/18"
+	}
 
 	originIP := net.ParseIP("10.1.9.207")
 	clusterIP := net.ParseIP("192.168.0.46")
@@ -69,7 +80,7 @@ func (m *mockGoBGPServer) ListPath(req *apipb.ListPathRequest, stream apipb.Gobg
 		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
 			bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint32{23764, 4134}),
 		}),
-		bgp.NewPathAttributeNextHop("172.31.255.10"),
+		nhAttr,
 		bgp.NewPathAttributeCommunities([]uint32{(23764 << 16) | 11100, (65535 << 16) | 80}),
 		bgp.NewPathAttributeOriginatorId(originIP.String()),
 		bgp.NewPathAttributeClusterList([]string{clusterIP.String()}),
@@ -94,7 +105,7 @@ func (m *mockGoBGPServer) ListPath(req *apipb.ListPathRequest, stream apipb.Gobg
 
 	return stream.Send(&apipb.ListPathResponse{
 		Destination: &apipb.Destination{
-			Prefix: m.rdStr + ":202.96.128.0/18",
+			Prefix: destPrefix,
 			Paths:  []*apipb.Path{p1},
 		},
 	})
@@ -175,15 +186,21 @@ func TestGoBGPgRPCVPNv4VrfLookup(t *testing.T) {
 	}
 	t.Logf("Raw output:\n%s", rawOut)
 
-	// Verify AS-Path query ("AS4134" and "23764 4134")
-	asPaths, _, _, okAS := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "aspath", "AS4134")
-	if !okAS || len(asPaths) != 1 {
-		t.Fatalf("expected AS-Path lookup for AS4134 to return 1 path, got %d", len(asPaths))
+	// Verify AS-Path query ("AS4134") returns BOTH IPv4 and IPv6 routes!
+	asPaths, asMatched, asRaw, okAS := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "aspath", "AS4134")
+	if !okAS || len(asPaths) != 2 {
+		t.Fatalf("expected dual-stack AS-Path lookup for AS4134 to return 2 paths (IPv4+IPv6), got %d (matched=%s raw=%s)", len(asPaths), asMatched, asRaw)
+	}
+	if asPaths[0].AddressFamily != "ipv4" || asPaths[1].AddressFamily != "ipv6" {
+		t.Fatalf("expected IPv4 + IPv6 paths in AS-Path lookup, got %s and %s", asPaths[0].AddressFamily, asPaths[1].AddressFamily)
 	}
 
-	// Verify BGP Community query ("23764:11100")
-	commPaths, _, _, okComm := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "community", "23764:11100")
-	if !okComm || len(commPaths) != 1 {
-		t.Fatalf("expected Community lookup for 23764:11100 to return 1 path, got %d", len(commPaths))
+	// Verify BGP Community query ("23764:11100") returns BOTH IPv4 and IPv6 routes!
+	commPaths, commMatched, _, okComm := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "community", "23764:11100")
+	if !okComm || len(commPaths) != 2 {
+		t.Fatalf("expected dual-stack Community lookup for 23764:11100 to return 2 paths (IPv4+IPv6), got %d (matched=%s)", len(commPaths), commMatched)
+	}
+	if commPaths[0].AddressFamily != "ipv4" || commPaths[1].AddressFamily != "ipv6" {
+		t.Fatalf("expected IPv4 + IPv6 paths in Community lookup, got %s and %s", commPaths[0].AddressFamily, commPaths[1].AddressFamily)
 	}
 }

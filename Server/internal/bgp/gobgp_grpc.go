@@ -199,8 +199,8 @@ func (e *Engine) queryLiveGoBGPgRPC(
 		return nil, "", "", false
 	}
 
-	// Helper to run a ListPath query with given family, RD, and lookup type
-	runLookup := func(tableType apipb.TableType, tableName string, safi apipb.Family_Safi, rd string, lType apipb.TableLookupPrefix_Type) ([]models.BGPRoutePath, string, string, bool) {
+	// Helper to run a ListPath query with given AFI, family label, RD, and lookup type
+	runLookup := func(targetAFI apipb.Family_Afi, famLabel string, tableType apipb.TableType, tableName string, safi apipb.Family_Safi, rd string, lType apipb.TableLookupPrefix_Type) ([]models.BGPRoutePath, string, string, bool) {
 		var prefixes []*apipb.TableLookupPrefix
 		batchSize := uint64(0)
 		sortType := apipb.ListPathRequest_PREFIX
@@ -225,7 +225,7 @@ func (e *Engine) queryLiveGoBGPgRPC(
 			TableType: tableType,
 			Name:      tableName,
 			Family: &apipb.Family{
-				Afi:  afi,
+				Afi:  targetAFI,
 				Safi: safi,
 			},
 			Prefixes:         prefixes,
@@ -233,25 +233,74 @@ func (e *Engine) queryLiveGoBGPgRPC(
 			BatchSize:        batchSize,
 			EnableOnlyBinary: onlyBinary,
 		}
-		return e.fetchPathsFromStream(cctx, client, req, rrNode, view, familyStr, queryType, target, rd)
+		return e.fetchPathsFromStream(cctx, client, req, rrNode, view, famLabel, queryType, target, rd)
+	}
+
+	// Dual-stack concurrent filter scan (IPv4 + IPv6 independently capped at 50 routes each)
+	// used by AS-Path and BGP Community queries so IPv4 never starves IPv6.
+	runDualStackFilter := func(safi apipb.Family_Safi, rd string) ([]models.BGPRoutePath, string, string, bool) {
+		var (
+			wg      sync.WaitGroup
+			v4Paths []models.BGPRoutePath
+			v6Paths []models.BGPRoutePath
+			v4Raw   string
+			v6Raw   string
+			v4OK    bool
+			v6OK    bool
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			v4Paths, _, v4Raw, v4OK = runLookup(apipb.Family_AFI_IP, "ipv4", apipb.TableType_GLOBAL, "", safi, rd, apipb.TableLookupPrefix_SHORTER)
+		}()
+		go func() {
+			defer wg.Done()
+			v6Paths, _, v6Raw, v6OK = runLookup(apipb.Family_AFI_IP6, "ipv6", apipb.TableType_GLOBAL, "", safi, rd, apipb.TableLookupPrefix_SHORTER)
+		}()
+		wg.Wait()
+
+		if !v4OK && !v6OK {
+			return nil, "", "", false
+		}
+		combined := make([]models.BGPRoutePath, 0, len(v4Paths)+len(v6Paths))
+		combined = append(combined, v4Paths...)
+		combined = append(combined, v6Paths...)
+		if len(combined) == 0 {
+			emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table.\n",
+				rrNode.Name, vrfName, target)
+			return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("# Node: %s | Engine: GOBGP | VRF: %s | Filter: %s\n",
+			rrNode.Name, vrfName, target))
+		if len(v4Paths) > 0 {
+			sb.WriteString(fmt.Sprintf("\n--- IPv4 Routes (%d matched) ---\n", len(v4Paths)))
+			sb.WriteString(v4Raw)
+		}
+		if len(v6Paths) > 0 {
+			sb.WriteString(fmt.Sprintf("\n--- IPv6 Routes (%d matched) ---\n", len(v6Paths)))
+			sb.WriteString(v6Raw)
+		}
+		summaryLabel := formatDualStackFilterSummary(target, len(v4Paths), len(v6Paths))
+		return combined, summaryLabel, sb.String(), true
 	}
 
 	// Case 1: VRF Mode (VRF has an RD in GoBGP, e.g. VRF-CN-OPTIMIZE -> RD 18013:1)
 	// Equivalent to: `gobgp global rib <ip>/32 rd <rd> shorter-prefixes -a vpnv4` (or vpnv6)
 	if rdStr != "" {
-		if queryType == "prefix" && isExactPrefix {
-			if paths, matched, rawOut, ok := runLookup(apipb.TableType_GLOBAL, "", apipb.Family_SAFI_MPLS_VPN, rdStr, apipb.TableLookupPrefix_EXACT); ok && len(paths) > 0 {
+		if queryType != "prefix" {
+			if paths, matched, rawOut, ok := runDualStackFilter(apipb.Family_SAFI_MPLS_VPN, rdStr); ok {
 				return paths, matched, rawOut, true
 			}
-		}
-		if paths, matched, rawOut, ok := runLookup(apipb.TableType_GLOBAL, "", apipb.Family_SAFI_MPLS_VPN, rdStr, apipb.TableLookupPrefix_SHORTER); ok {
-			if len(paths) > 0 {
-				return paths, matched, rawOut, true
+		} else {
+			if isExactPrefix {
+				if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_MPLS_VPN, rdStr, apipb.TableLookupPrefix_EXACT); ok && len(paths) > 0 {
+					return paths, matched, rawOut, true
+				}
 			}
-			if queryType != "prefix" {
-				emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table.\n",
-					rrNode.Name, vrfName, target)
-				return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
+			if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_MPLS_VPN, rdStr, apipb.TableLookupPrefix_SHORTER); ok && len(paths) > 0 {
+				return paths, matched, rawOut, true
 			}
 		}
 	}
@@ -259,26 +308,25 @@ func (e *Engine) queryLiveGoBGPgRPC(
 	// Case 2: Single Global Unicast RIB (`vrf_name` is empty / "global" or VRF has no VPN RD)
 	// Equivalent to: `gobgp global rib <ip>/32 shorter-prefixes -a ipv4` (or ipv6)
 	if isGlobalRIB(vrfName) || rdStr == "" {
-		if queryType == "prefix" && isExactPrefix {
-			if paths, matched, rawOut, ok := runLookup(apipb.TableType_GLOBAL, "", apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_EXACT); ok && len(paths) > 0 {
+		if queryType != "prefix" {
+			if paths, matched, rawOut, ok := runDualStackFilter(apipb.Family_SAFI_UNICAST, ""); ok {
 				return paths, matched, rawOut, true
 			}
-		}
-		if paths, matched, rawOut, ok := runLookup(apipb.TableType_GLOBAL, "", apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER); ok {
-			if len(paths) > 0 {
-				return paths, matched, rawOut, true
+		} else {
+			if isExactPrefix {
+				if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_EXACT); ok && len(paths) > 0 {
+					return paths, matched, rawOut, true
+				}
 			}
-			if queryType != "prefix" {
-				emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table.\n",
-					rrNode.Name, vrfName, target)
-				return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
+			if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER); ok && len(paths) > 0 {
+				return paths, matched, rawOut, true
 			}
 		}
 	}
 
 	// Case 3: Neighbor Adj-RIB-In fallback (`gobgp neighbor <ip> adj-in <ip>/32 shorter-prefixes`)
-	if neighborIP != "" {
-		if paths, matched, rawOut, ok := runLookup(apipb.TableType_ADJ_IN, neighborIP, apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER); ok && len(paths) > 0 {
+	if queryType == "prefix" && neighborIP != "" {
+		if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_ADJ_IN, neighborIP, apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER); ok && len(paths) > 0 {
 			return paths, matched, rawOut, true
 		}
 	}
@@ -572,8 +620,13 @@ func (e *Engine) fetchPathsFromStream(
 		}
 
 		var rawBuilder strings.Builder
-		rawBuilder.WriteString(fmt.Sprintf("   %-20s %-16s %-6s %-6s %-9s %-24s %s\n",
-			"Network", "Next Hop", "LocPrf", "MED", "Age", "AS_PATH", "Attrs"))
+		if familyStr == "ipv6" {
+			rawBuilder.WriteString(fmt.Sprintf("   %-32s %-30s %-6s %-6s %-9s %-24s %s\n",
+				"Network", "Next Hop", "LocPrf", "MED", "Age", "AS_PATH", "Attrs"))
+		} else {
+			rawBuilder.WriteString(fmt.Sprintf("   %-20s %-16s %-6s %-6s %-9s %-24s %s\n",
+				"Network", "Next Hop", "LocPrf", "MED", "Age", "AS_PATH", "Attrs"))
+		}
 		for _, line := range rawLines {
 			rawBuilder.WriteString(line + "\n")
 		}
@@ -926,8 +979,14 @@ func (e *Engine) decodeGoBGPPath(
 		symbol = "*>"
 	}
 	asDisplay := strings.TrimSpace(asPathStr + " " + originShort)
-	leftCols := fmt.Sprintf("%-2s %-20s %-16s %-6d %-6d %-9s %-24s ",
-		symbol, cleanPrefix, nextHop, localPref, med, ageStr, asDisplay)
+	var leftCols string
+	if familyStr == "ipv6" {
+		leftCols = fmt.Sprintf("%-2s %-32s %-30s %-6d %-6d %-9s %-24s ",
+			symbol, cleanPrefix, nextHop, localPref, med, ageStr, asDisplay)
+	} else {
+		leftCols = fmt.Sprintf("%-2s %-20s %-16s %-6d %-6d %-9s %-24s ",
+			symbol, cleanPrefix, nextHop, localPref, med, ageStr, asDisplay)
+	}
 	rawLine := formatFullWidthPathLine(leftCols, stdComms, extComms, largeComms)
 
 	return models.BGPRoutePath{

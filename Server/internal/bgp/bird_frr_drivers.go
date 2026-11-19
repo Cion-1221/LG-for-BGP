@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"lg-for-bgp/internal/models"
@@ -19,6 +20,19 @@ import (
 var reSafeVRFName = regexp.MustCompile(`^[a-zA-Z0-9_\-]{1,64}$`)
 
 const maxDriverFilterMatches = 50
+
+func formatDualStackFilterSummary(target string, v4Count, v6Count int) string {
+	switch {
+	case v4Count > 0 && v6Count > 0:
+		return fmt.Sprintf("Filter: %s (%d IPv4 + %d IPv6 routes)", target, v4Count, v6Count)
+	case v4Count > 0:
+		return fmt.Sprintf("Filter: %s (%d IPv4 routes)", target, v4Count)
+	case v6Count > 0:
+		return fmt.Sprintf("Filter: %s (%d IPv6 routes)", target, v6Count)
+	default:
+		return "No matching route"
+	}
+}
 
 // isGlobalRIB returns true when VRFName is empty or set to "global" / "default" / "master"
 // indicating a single-table router/RR without VRFs.
@@ -165,16 +179,91 @@ func (e *Engine) RunLocalBird2Query(
 	if sock != "" && !strings.EqualFold(sock, "local") && !strings.Contains(sock, ":") {
 		birdArgs = append(birdArgs, "-s", sock)
 	}
-	birdArgs = append(birdArgs, "-r", birdCmd)
 
-	cmd := exec.CommandContext(cctx, birdcBin, birdArgs...)
-	outBytes, err := cmd.Output()
-	if err != nil || len(outBytes) == 0 {
-		return nil, "", "", false
+	runBirdCmd := func(command string) (string, bool) {
+		args := append(append([]string{}, birdArgs...), "-r", command)
+		outBytes, err := exec.CommandContext(cctx, birdcBin, args...).Output()
+		if err != nil || len(outBytes) == 0 {
+			return "", false
+		}
+		rawOut := string(outBytes)
+		if strings.Contains(rawOut, "syntax error") || strings.Contains(rawOut, "Unable to connect") {
+			return "", false
+		}
+		return rawOut, true
 	}
 
-	rawOut := string(outBytes)
-	if strings.Contains(rawOut, "syntax error") || strings.Contains(rawOut, "Unable to connect") {
+	// For AS-Path / Community scans on global RIB (or split v4/v6 tables), query IPv4 & IPv6 tables independently
+	// so IPv4 matches never starve IPv6 matches.
+	if queryType != "prefix" {
+		v4Table := ""
+		v6Table := ""
+		if isGlobalRIB(vrfName) {
+			v4Table = "master4"
+			v6Table = "master6"
+		} else if t4, t6 := strings.TrimSpace(view.BirdTableV4), strings.TrimSpace(view.BirdTableV6); t4 != "" && t6 != "" && t4 != t6 && reSafeVRFName.MatchString(t4) && reSafeVRFName.MatchString(t6) {
+			v4Table = t4
+			v6Table = t6
+		}
+		if v4Table != "" && v6Table != "" {
+			wherePart := strings.TrimPrefix(birdCmd, "show route ")
+			wherePart = strings.TrimPrefix(wherePart, tableClause)
+			var (
+				wg         sync.WaitGroup
+				raw4, raw6 string
+				ok4, ok6   bool
+			)
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				raw4, ok4 = runBirdCmd(fmt.Sprintf("show route table '%s' %s", v4Table, wherePart))
+			}()
+			go func() {
+				defer wg.Done()
+				raw6, ok6 = runBirdCmd(fmt.Sprintf("show route table '%s' %s", v6Table, wherePart))
+			}()
+			wg.Wait()
+			if ok4 || ok6 {
+				var p4, p6 []models.BGPRoutePath
+				var clip4, clip6 string
+				if ok4 && !strings.Contains(raw4, "Network not in table") {
+					p4, _, clip4 = e.parseBird2Output(raw4, view, target, maxDriverFilterMatches)
+				}
+				if ok6 && !strings.Contains(raw6, "Network not in table") {
+					p6, _, clip6 = e.parseBird2Output(raw6, view, target, maxDriverFilterMatches)
+				}
+				combined := make([]models.BGPRoutePath, 0, len(p4)+len(p6))
+				combined = append(combined, p4...)
+				combined = append(combined, p6...)
+				if len(combined) == 0 {
+					emptyRaw := fmt.Sprintf("# Node: %s | Engine: BIRD2\n# VRF: %s | Filter: %s\nNetwork not in table.\n",
+						rrNode.Name, vrfName, target)
+					return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
+				}
+				var sb strings.Builder
+				sb.WriteString(fmt.Sprintf("# Node: %s | Engine: BIRD2 | VRF: %s | Filter: %s\n",
+					rrNode.Name, vrfName, target))
+				if len(p4) > 0 {
+					sb.WriteString(fmt.Sprintf("\n--- IPv4 Routes (%d matched) ---\n", len(p4)))
+					sb.WriteString(clip4)
+					if !strings.HasSuffix(clip4, "\n") {
+						sb.WriteString("\n")
+					}
+				}
+				if len(p6) > 0 {
+					sb.WriteString(fmt.Sprintf("\n--- IPv6 Routes (%d matched) ---\n", len(p6)))
+					sb.WriteString(clip6)
+					if !strings.HasSuffix(clip6, "\n") {
+						sb.WriteString("\n")
+					}
+				}
+				return combined, formatDualStackFilterSummary(target, len(p4), len(p6)), sb.String(), true
+			}
+		}
+	}
+
+	rawOut, ok := runBirdCmd(birdCmd)
+	if !ok {
 		return nil, "", "", false
 	}
 	if strings.Contains(rawOut, "Network not in table") {
@@ -190,31 +279,51 @@ func (e *Engine) RunLocalBird2Query(
 		return []models.BGPRoutePath{}, "No matching route", rawOut, true
 	}
 	if queryType != "prefix" {
-		matched = fmt.Sprintf("Filter: %s (%d routes)", target, len(paths))
+		v4c, v6c := 0, 0
+		for _, p := range paths {
+			if p.AddressFamily == "ipv6" {
+				v6c++
+			} else {
+				v4c++
+			}
+		}
+		matched = formatDualStackFilterSummary(target, v4c, v6c)
 	}
 	return paths, matched, clippedRaw, true
 }
 
-func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, target string, maxPaths int) ([]models.BGPRoutePath, string, string) {
+func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, target string, maxPerFamily int) ([]models.BGPRoutePath, string, string) {
 	lines := strings.Split(rawOut, "\n")
 	var paths []models.BGPRoutePath
 	var matchedPrefix string
 	var cur *models.BGPRoutePath
 	var curComms []string
+	var curLines []string
 	var keptLines []string
 	seq := uint32(1)
+	v4Count, v6Count := 0, 0
 	truncated := false
 
 	flush := func() {
 		if cur != nil {
-			if maxPaths <= 0 || len(paths) < maxPaths {
+			withinLimit := maxPerFamily <= 0 ||
+				(cur.AddressFamily == "ipv6" && v6Count < maxPerFamily) ||
+				(cur.AddressFamily != "ipv6" && v4Count < maxPerFamily)
+			if withinLimit {
 				cur.Communities = e.TranslateCommunities(curComms)
 				paths = append(paths, *cur)
+				keptLines = append(keptLines, curLines...)
+				if cur.AddressFamily == "ipv6" {
+					v6Count++
+				} else {
+					v4Count++
+				}
 			} else {
 				truncated = true
 			}
 			cur = nil
 			curComms = nil
+			curLines = nil
 		}
 	}
 
@@ -226,7 +335,7 @@ func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, targ
 		isHeader := !strings.HasPrefix(rawLine, "\t") && !strings.HasPrefix(rawLine, " ") && (strings.Contains(line, "unicast") || strings.Contains(line, " ["))
 		if isHeader {
 			flush()
-			if maxPaths > 0 && len(paths) >= maxPaths {
+			if maxPerFamily > 0 && v4Count >= maxPerFamily && v6Count >= maxPerFamily {
 				truncated = true
 				break
 			}
@@ -242,6 +351,10 @@ func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, targ
 			if strings.Contains(matchedPrefix, ":") {
 				fam = "ipv6"
 			}
+			if maxPerFamily > 0 && ((fam == "ipv6" && v6Count >= maxPerFamily) || (fam != "ipv6" && v4Count >= maxPerFamily)) {
+				truncated = true
+				continue
+			}
 			cur = &models.BGPRoutePath{
 				PathID:         seq,
 				Prefix:         matchedPrefix,
@@ -255,13 +368,13 @@ func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, targ
 				ValidationNote: "BIRD 2 Route",
 			}
 			seq++
-			keptLines = append(keptLines, rawLine)
+			curLines = []string{rawLine}
 			continue
 		}
 		if cur == nil {
 			continue
 		}
-		keptLines = append(keptLines, rawLine)
+		curLines = append(curLines, rawLine)
 		if strings.HasPrefix(line, "BGP.next_hop:") {
 			cur.NextHop = strings.TrimSpace(strings.TrimPrefix(line, "BGP.next_hop:"))
 		} else if strings.HasPrefix(line, "via ") {
@@ -310,7 +423,7 @@ func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, targ
 	}
 	outRaw := rawOut
 	if truncated && len(keptLines) > 0 {
-		outRaw = strings.Join(keptLines, "\n") + fmt.Sprintf("\n# ... truncated after %d matching routes ...\n", maxPaths)
+		outRaw = strings.Join(keptLines, "\n") + fmt.Sprintf("\n# ... truncated after %d matching routes per address family ...\n", maxPerFamily)
 	}
 	return paths, matchedPrefix, outRaw
 }
@@ -767,29 +880,32 @@ func (e *Engine) RunLocalFrrQuery(
 
 	vtyshAlive := false
 	for _, clause := range clauses {
-		var results []models.BGPRoutePath
-		var rawLines []string
-		matchedAnyScope := false
+		type afScanRes struct {
+			alive    bool
+			paths    []models.BGPRoutePath
+			rawLines []string
+		}
+		var (
+			wg sync.WaitGroup
+			r4 afScanRes
+			r6 afScanRes
+		)
 
-		for _, afStr := range []string{"ipv4", "ipv6"} {
-			if len(results) >= maxDriverFilterMatches {
-				break
-			}
+		scanAF := func(afStr string, out *afScanRes) {
 			vtyCmdJSON := fmt.Sprintf("show bgp %s%s unicast %s json", clause, afStr, filterClause)
 			jsonBytes, err := runVtysh(cctx, vtyshBin, vtyBaseArgs, vtyCmdJSON)
 			if err != nil {
-				continue
+				return
 			}
 			rawStr := strings.TrimSpace(string(jsonBytes))
 			if frrOutputIsScopeError(rawStr) {
-				continue
+				return
 			}
-			vtyshAlive = true
-			matchedAnyScope = true
+			out.alive = true
 
 			var tableResp frrTableJSONResponse
 			if err := json.Unmarshal(jsonBytes, &tableResp); err != nil || len(tableResp.Routes) == 0 {
-				continue
+				return
 			}
 
 			prefixes := make([]string, 0, len(tableResp.Routes))
@@ -799,34 +915,71 @@ func (e *Engine) RunLocalFrrQuery(
 			sort.Strings(prefixes)
 
 			for _, pfx := range prefixes {
-				if len(results) >= maxDriverFilterMatches {
+				if len(out.paths) >= maxDriverFilterMatches {
 					break
 				}
 				converted := e.convertFRRPaths(pfx, afStr, vrfName, view, tableResp.Routes[pfx])
 				for _, rp := range converted {
-					if len(results) >= maxDriverFilterMatches {
+					if len(out.paths) >= maxDriverFilterMatches {
 						break
 					}
-					results = append(results, rp)
+					out.paths = append(out.paths, rp)
 					sym := "* "
 					if rp.Best {
 						sym = "*>"
 					}
-					rawLines = append(rawLines, fmt.Sprintf("%-2s %-22s %-16s %-6d %-6d %s",
-						sym, rp.Prefix, rp.NextHop, rp.LocalPref, rp.MED, rp.ASPathString))
+					if afStr == "ipv6" {
+						out.rawLines = append(out.rawLines, fmt.Sprintf("%-2s %-36s %-32s %-6d %-6d %s",
+							sym, rp.Prefix, rp.NextHop, rp.LocalPref, rp.MED, rp.ASPathString))
+					} else {
+						out.rawLines = append(out.rawLines, fmt.Sprintf("%-2s %-22s %-16s %-6d %-6d %s",
+							sym, rp.Prefix, rp.NextHop, rp.LocalPref, rp.MED, rp.ASPathString))
+					}
 				}
 			}
 		}
 
-		if len(results) > 0 {
+		// Query IPv4 and IPv6 concurrently with independent per-family limits so IPv4 never starves IPv6
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			scanAF("ipv4", &r4)
+		}()
+		go func() {
+			defer wg.Done()
+			scanAF("ipv6", &r6)
+		}()
+		wg.Wait()
+
+		matchedAnyScope := r4.alive || r6.alive
+		if matchedAnyScope {
+			vtyshAlive = true
+		}
+
+		total := len(r4.paths) + len(r6.paths)
+		if total > 0 {
+			results := make([]models.BGPRoutePath, 0, total)
+			results = append(results, r4.paths...)
+			results = append(results, r6.paths...)
+
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("# Node: %s | Engine: FRR | VRF: %s | Filter: %s\n",
 				rrNode.Name, vrfName, target))
-			sb.WriteString(fmt.Sprintf("   %-22s %-16s %-6s %-6s %s\n", "Network", "Next Hop", "LocPrf", "MED", "AS_PATH"))
-			for _, line := range rawLines {
-				sb.WriteString(line + "\n")
+			if len(r4.rawLines) > 0 {
+				sb.WriteString(fmt.Sprintf("\n--- IPv4 Unicast (%d routes) ---\n", len(r4.paths)))
+				sb.WriteString(fmt.Sprintf("   %-22s %-16s %-6s %-6s %s\n", "Network", "Next Hop", "LocPrf", "MED", "AS_PATH"))
+				for _, line := range r4.rawLines {
+					sb.WriteString(line + "\n")
+				}
 			}
-			summaryLabel := fmt.Sprintf("Filter: %s (%d routes)", target, len(results))
+			if len(r6.rawLines) > 0 {
+				sb.WriteString(fmt.Sprintf("\n--- IPv6 Unicast (%d routes) ---\n", len(r6.paths)))
+				sb.WriteString(fmt.Sprintf("   %-36s %-32s %-6s %-6s %s\n", "Network", "Next Hop", "LocPrf", "MED", "AS_PATH"))
+				for _, line := range r6.rawLines {
+					sb.WriteString(line + "\n")
+				}
+			}
+			summaryLabel := formatDualStackFilterSummary(target, len(r4.paths), len(r6.paths))
 			return results, summaryLabel, sb.String(), true
 		}
 		if matchedAnyScope {
