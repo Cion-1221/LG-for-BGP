@@ -1,3 +1,4 @@
+// Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 package logger
 
 import (

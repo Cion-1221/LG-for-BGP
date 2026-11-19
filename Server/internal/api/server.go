@@ -1,3 +1,4 @@
+// Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 package api
 
 import (
@@ -220,6 +221,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":    "ok",
 		"service":   "lg-for-bgp-server",
+		"version":   "v2.0.0",
 		"db_driver": s.store.DBDriver(),
 		"asn":       settings.PrimaryASN,
 		"dc":        settings.DatacenterCode,

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 # ==============================================================================
 # Automated Setup Script for Debian 13 (Trixie) / Ubuntu 24.04 LTS (Noble)+
 # Architecture:

@@ -1,3 +1,4 @@
+// Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 

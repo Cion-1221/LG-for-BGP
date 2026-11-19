@@ -1,3 +1,4 @@
+-- Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 -- ==============================================================================
 -- LG-for-BGP Embedded SQLite3 Database Schema Reference
 -- Ideal for minimal Linux appliances (e.g., VyOS) or single-node deployments

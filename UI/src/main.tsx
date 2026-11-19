@@ -1,3 +1,4 @@
+// Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';

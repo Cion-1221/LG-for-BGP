@@ -1,3 +1,4 @@
+-- Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 -- ==============================================================================
 -- LG-for-BGP Relational Database Schema for MySQL 8.4+ / 9.x & MariaDB 11.x
 -- Compatible with Debian 13 (Trixie) & Ubuntu 24.04 LTS (Noble) or higher

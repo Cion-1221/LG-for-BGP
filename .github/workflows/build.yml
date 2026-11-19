@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 name: Build & Package BGP Looking Glass
 
 on:
@@ -134,20 +135,25 @@ jobs:
             release-pkg/lg-for-bgp-linux-amd64.tar.gz
             release-pkg/lg-for-bgp-linux-arm64.tar.gz
 
-      - name: Purge Historical Releases, Tags & Workflow Runs
+      - name: Replace Target Release Assets & Purge Old Workflow Runs (Keep v1.0.0 Intact)
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TARGET_TAG="v1.0.0"
+          TARGET_TAG="v2.0.0"
           if [ "${{ github.ref_type }}" = "tag" ]; then
             TARGET_TAG="${{ github.ref_name }}"
           fi
 
-          # 1. Remove any existing release with the same target tag (and any legacy v1.0.1..v1.2.1 releases) before publishing fresh assets
-          for rel_id in $(gh api "repos/${{ github.repository }}/releases?per_page=100" -q ".[] | select(.tag_name == \"${TARGET_TAG}\" or (.tag_name != \"v1.0.0\" and .tag_name != \"${TARGET_TAG}\")) | .id" 2>/dev/null || true); do
-            gh api -X DELETE "repos/${{ github.repository }}/releases/${rel_id}" || true
-          done
+          # 1. Only replace an existing release matching TARGET_TAG (e.g. v2.0.0); NEVER touch or delete v1.0.0
+          if [ "${TARGET_TAG}" != "v1.0.0" ]; then
+            for rel_id in $(gh api "repos/${{ github.repository }}/releases?per_page=100" -q ".[] | select(.tag_name == \"${TARGET_TAG}\") | .id" 2>/dev/null || true); do
+              gh api -X DELETE "repos/${{ github.repository }}/releases/${rel_id}" || true
+            done
+            if [ "${{ github.ref_type }}" != "tag" ]; then
+              gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${TARGET_TAG}" 2>/dev/null || true
+            fi
+          fi
 
           # 2. Delete all completed historical Actions workflow runs from previous commits
           for run_id in $(gh api "repos/${{ github.repository }}/actions/runs?per_page=100" -q '.workflow_runs[] | select(.head_sha != "${{ github.sha }}" and .status == "completed") | .id' 2>/dev/null || true); do
@@ -158,8 +164,8 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v1.0.0' }}
-          name: "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v1.0.0' }} — Official Release"
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.0.0' }}
+          name: "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.0.0' }} — Official Release"
           files: |
             release-pkg/lg-for-bgp-linux-amd64.tar.gz
             release-pkg/lg-for-bgp-linux-arm64.tar.gz

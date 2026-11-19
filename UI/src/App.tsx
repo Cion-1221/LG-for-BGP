@@ -1,3 +1,4 @@
+// Copyright (c) 2026 Alan <alan.xiao@cionsiu.com>
 import React, { useEffect, useMemo, useState } from 'react';
 import { api, BootstrapResponse, setToken } from './api';
 import {
@@ -577,6 +578,23 @@ export const App: React.FC = () => {
     </div>
   );
 
+  const renderFooter = () => (
+    <footer className={`border-t ${borderSubtle} py-4 mt-auto`}>
+      <div className={`${layoutContainer} flex items-center justify-center text-xs ${textSecondary}`}>
+        <span>
+          Copyright © {new Date().getFullYear()}{' '}
+          <a
+            href="mailto:alan.xiao@cionsiu.com"
+            className={`font-semibold hover:underline ${textSky}`}
+            title="Contact Alan (alan.xiao@cionsiu.com)"
+          >
+            Alan
+          </a>
+        </span>
+      </div>
+    </footer>
+  );
+
   if (loadingBoot || !boot) {
     return (
       <div className={`min-h-screen ${bgPage} flex items-center justify-center`}>
@@ -690,20 +708,23 @@ export const App: React.FC = () => {
 
   if (portalMode === 'notfound') {
     return (
-      <div className={`min-h-screen ${bgPage} flex flex-col items-center justify-center p-4`}>
-        <div className={`max-w-md w-full ${bgCard} border rounded-2xl p-8 text-center space-y-4`}>
-          <div className="text-3xl font-bold font-mono text-rose-500">404</div>
-          <div className={`text-base font-semibold ${textPrimary}`}>Page Not Found</div>
-          <p className={`text-xs ${textSecondary} leading-relaxed`}>
-            The requested endpoint does not exist on this Looking Glass server.
-          </p>
-          <button
-            onClick={() => switchPortal('lg')}
-            className="px-5 py-2.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition"
-          >
-            Return to Looking Glass
-          </button>
+      <div className={`min-h-screen ${bgPage} flex flex-col`}>
+        <div className="flex-1 flex flex-col items-center justify-center p-4">
+          <div className={`max-w-md w-full ${bgCard} border rounded-2xl p-8 text-center space-y-4`}>
+            <div className="text-3xl font-bold font-mono text-rose-500">404</div>
+            <div className={`text-base font-semibold ${textPrimary}`}>Page Not Found</div>
+            <p className={`text-xs ${textSecondary} leading-relaxed`}>
+              The requested endpoint does not exist on this Looking Glass server.
+            </p>
+            <button
+              onClick={() => switchPortal('lg')}
+              className="px-5 py-2.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition"
+            >
+              Return to Looking Glass
+            </button>
+          </div>
         </div>
+        {renderFooter()}
       </div>
     );
   }
@@ -742,7 +763,8 @@ export const App: React.FC = () => {
 
     if (!isAdminAuthenticated) {
       return (
-        <div className={`min-h-screen ${bgPage} flex flex-col justify-center items-center p-4`}>
+        <div className={`min-h-screen ${bgPage} flex flex-col`}>
+          <div className="flex-1 flex flex-col justify-center items-center p-4">
           <div className={`max-w-md w-full ${bgCard} border rounded-2xl p-7`}>
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-3">
@@ -800,6 +822,8 @@ export const App: React.FC = () => {
               </button>
             </form>
           </div>
+          </div>
+          {renderFooter()}
         </div>
       );
     }
@@ -2905,6 +2929,7 @@ export const App: React.FC = () => {
             })()}
           </section>
         </div>
+        {renderFooter()}
       </div>
     );
   }
@@ -3331,6 +3356,7 @@ export const App: React.FC = () => {
           </div>
         )}
       </main>
+      {renderFooter()}
     </div>
   );
 };
