@@ -107,6 +107,8 @@ export interface SystemSettings {
   cache_ttl_seconds: number;
   rate_limit_per_minute: number;
   organization_name: string;
+  favicon_icon?: string;
+  portal_logo?: string;
   primary_asn: number;
   datacenter_code: string;
   allow_raw_output: boolean;

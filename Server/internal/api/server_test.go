@@ -211,6 +211,34 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 	if recUnblocked.Code != http.StatusOK {
 		t.Fatalf("expected 200 after manual unban, got %d: %s", recUnblocked.Code, recUnblocked.Body.String())
 	}
+
+	// 9. Verify custom favicon_icon & portal_logo upload validation and bootstrap exposure
+	validPNG := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+	goodSettings := st.GetAdminSettings()
+	goodSettings.OrganizationName = "ASLINE LG Portal"
+	goodSettings.FaviconIcon = validPNG
+	goodSettings.PortalLogo = validPNG
+	goodPayload, _ := json.Marshal(goodSettings)
+	reqSetGood := httptest.NewRequest(http.MethodPut, "/api/v1/admin/settings", bytes.NewReader(goodPayload))
+	reqSetGood.Header.Set("Authorization", "Bearer "+adminResp.Token)
+	recSetGood := httptest.NewRecorder()
+	handler.ServeHTTP(recSetGood, reqSetGood)
+	if recSetGood.Code != http.StatusOK {
+		t.Fatalf("expected 200 saving valid PNG icons, got %d: %s", recSetGood.Code, recSetGood.Body.String())
+	}
+
+	// Reject malicious SVG containing <script>
+	badSettings := goodSettings
+	badSettings.FaviconIcon = "data:image/svg+xml;base64,PHN2Zz48c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ+PC9zdmc+"
+	badPayload, _ := json.Marshal(badSettings)
+	reqSetBad := httptest.NewRequest(http.MethodPut, "/api/v1/admin/settings", bytes.NewReader(badPayload))
+	reqSetBad.Header.Set("Authorization", "Bearer "+adminResp.Token)
+	recSetBad := httptest.NewRecorder()
+	handler.ServeHTTP(recSetBad, reqSetBad)
+	if recSetBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting malicious SVG icon, got %d: %s", recSetBad.Code, recSetBad.Body.String())
+	}
+
 	srv.Close()
 	cache.Close()
 	_ = st.Close()

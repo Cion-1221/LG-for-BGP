@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS lg_settings (
     cache_ttl_seconds INT NOT NULL DEFAULT 30,
     rate_limit_per_minute INT NOT NULL DEFAULT 60,
     organization_name VARCHAR(128) NOT NULL DEFAULT 'BGP Looking Glass Portal',
+    favicon_icon MEDIUMTEXT NULL,
+    portal_logo MEDIUMTEXT NULL,
     primary_asn INT UNSIGNED NOT NULL DEFAULT 65000,
     datacenter_code VARCHAR(64) NOT NULL DEFAULT 'CORE-POP-01',
     allow_raw_output TINYINT(1) NOT NULL DEFAULT 1,

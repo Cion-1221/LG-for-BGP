@@ -186,6 +186,8 @@ type SystemSettings struct {
 	CacheTTLSeconds    int           `json:"cache_ttl_seconds"`
 	RateLimitPerMinute int           `json:"rate_limit_per_minute"`
 	OrganizationName   string        `json:"organization_name"`
+	FaviconIcon        string        `json:"favicon_icon"` // Custom browser tab favicon (base64 Data URL; empty = built-in default)
+	PortalLogo         string        `json:"portal_logo"`  // Custom Public Portal header logo (base64 Data URL; empty = default BGP badge)
 	PrimaryASN         uint32        `json:"primary_asn"`
 	DatacenterCode     string        `json:"datacenter_code"`
 	AllowRawOutput     bool          `json:"allow_raw_output"`

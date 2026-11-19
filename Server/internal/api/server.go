@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -544,6 +545,54 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) *models.Us
 	return u
 }
 
+const maxIconDataURLLength = 400 * 1024 // ~290 KB binary image after base64 encoding
+
+var allowedIconDataURLPrefixes = []string{
+	"data:image/png;base64,",
+	"data:image/jpeg;base64,",
+	"data:image/jpg;base64,",
+	"data:image/webp;base64,",
+	"data:image/gif;base64,",
+	"data:image/x-icon;base64,",
+	"data:image/vnd.microsoft.icon;base64,",
+	"data:image/svg+xml;base64,",
+}
+
+func validateIconDataURL(fieldName, val string) error {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return nil
+	}
+	if len(trimmed) > maxIconDataURLLength {
+		return fmt.Errorf("%s is too large (maximum image size is 256 KB)", fieldName)
+	}
+	lower := strings.ToLower(trimmed)
+	matchedPrefix := ""
+	for _, prefix := range allowedIconDataURLPrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			matchedPrefix = prefix
+			break
+		}
+	}
+	if matchedPrefix == "" {
+		return fmt.Errorf("%s must be a valid base64 image (PNG, ICO, SVG, WebP, JPG, or GIF)", fieldName)
+	}
+	b64Part := trimmed[len(matchedPrefix):]
+	decoded, err := base64.StdEncoding.DecodeString(b64Part)
+	if err != nil || len(decoded) == 0 {
+		return fmt.Errorf("%s contains invalid base64 image data", fieldName)
+	}
+	if matchedPrefix == "data:image/svg+xml;base64," {
+		svgLower := strings.ToLower(string(decoded))
+		for _, bad := range []string{"<script", "javascript:", "<foreignobject", "onload=", "onerror=", "onclick=", "onmouseover="} {
+			if strings.Contains(svgLower, bad) {
+				return fmt.Errorf("%s SVG contains disallowed active content (%s)", fieldName, bad)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	admin := s.requireAdmin(w, r)
 	if admin == nil {
@@ -556,6 +605,7 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPut || r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB max payload (allows 2 icons <= 256 KB each)
 		var newSettings models.SystemSettings
 		if err := json.NewDecoder(r.Body).Decode(&newSettings); err != nil {
 			writeError(w, http.StatusBadRequest, "Invalid settings payload")
@@ -563,6 +613,16 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if newSettings.AccessMode != models.AccessModeAuthRequired && newSettings.AccessMode != models.AccessModePublic {
 			writeError(w, http.StatusBadRequest, "Invalid access mode (allowed: auth_required or public)")
+			return
+		}
+		newSettings.FaviconIcon = strings.TrimSpace(newSettings.FaviconIcon)
+		newSettings.PortalLogo = strings.TrimSpace(newSettings.PortalLogo)
+		if err := validateIconDataURL("favicon_icon", newSettings.FaviconIcon); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := validateIconDataURL("portal_logo", newSettings.PortalLogo); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		updated, err := s.store.UpdateSettings(newSettings)

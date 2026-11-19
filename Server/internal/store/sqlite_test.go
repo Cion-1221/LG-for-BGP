@@ -26,9 +26,11 @@ func TestSQLiteStoreFullPersistenceAndPoPViewIDs(t *testing.T) {
 		ConnMaxIdleTimeMinutes: 5,
 	})
 
-	// 1. Update settings
+	// 1. Update settings (including custom favicon_icon & portal_logo)
 	settings := st.GetAdminSettings()
 	settings.OrganizationName = "VyOS Edge LG"
+	settings.FaviconIcon = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+	settings.PortalLogo = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 	settings.PrimaryASN = 18913
 	settings.DatacenterCode = "HKG4-LG-RR02"
 	if _, err := st.UpdateSettings(settings); err != nil {
@@ -123,8 +125,9 @@ func TestSQLiteStoreFullPersistenceAndPoPViewIDs(t *testing.T) {
 	defer func() { _ = st2.Close() }()
 
 	s2 := st2.GetAdminSettings()
-	if s2.OrganizationName != "VyOS Edge LG" || s2.PrimaryASN != 18913 {
-		t.Fatalf("settings did not persist across reopen: %+v", s2)
+	if s2.OrganizationName != "VyOS Edge LG" || s2.PrimaryASN != 18913 ||
+		s2.FaviconIcon != settings.FaviconIcon || s2.PortalLogo != settings.PortalLogo {
+		t.Fatalf("settings (including icons) did not persist across reopen: %+v", s2)
 	}
 	if len(st2.GetPOPs()) != 2 {
 		t.Fatalf("expected 2 PoPs after reopen, got %d", len(st2.GetPOPs()))

@@ -16,6 +16,13 @@ import {
 
 type ThemeMode = 'light' | 'dark' | 'system';
 
+const MAX_ICON_FILE_BYTES = 256 * 1024; // 256 KB
+const DEFAULT_FAVICON_DATA_URL =
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0ea5e9"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#g)"/><text x="32" y="39" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="800" font-size="22" fill="#ffffff">BGP</text></svg>'
+  );
+
 function getCurrentEntrySlug(): string {
   const hash = window.location.hash.replace(/^#\/?/, '').trim();
   if (hash) return hash;
@@ -55,6 +62,73 @@ export const App: React.FC = () => {
     document.body.style.backgroundColor = isDark ? '#060911' : '#f8fafc';
     document.body.style.color = isDark ? '#f1f5f9' : '#0f172a';
   }, [isDark]);
+
+  // Sync browser tab <title> with Portal Title / Organization Name
+  useEffect(() => {
+    const orgTitle = (boot?.settings?.organization_name || '').trim() || 'BGP Looking Glass';
+    if (portalMode === 'admin') {
+      document.title = `${orgTitle} - Admin`;
+    } else if (portalMode === 'notfound') {
+      document.title = `404 - ${orgTitle}`;
+    } else {
+      document.title = orgTitle;
+    }
+  }, [boot?.settings?.organization_name, portalMode]);
+
+  // Sync browser tab favicon (<link rel="icon">) with uploaded Favicon Icon (or built-in default)
+  useEffect(() => {
+    const iconHref = (boot?.settings?.favicon_icon || '').trim() || DEFAULT_FAVICON_DATA_URL;
+    const ensureLink = (rel: string) => {
+      let el = document.querySelector<HTMLLinkElement>(`link[rel="${rel}"]`);
+      if (!el) {
+        el = document.createElement('link');
+        el.rel = rel;
+        document.head.appendChild(el);
+      }
+      el.href = iconHref;
+    };
+    ensureLink('icon');
+    ensureLink('shortcut icon');
+  }, [boot?.settings?.favicon_icon]);
+
+  const handleIconFileUpload = (
+    field: 'favicon_icon' | 'portal_logo',
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !boot) return;
+    if (file.size > MAX_ICON_FILE_BYTES) {
+      setAdminMsg(
+        `Icon file is too large (${Math.ceil(file.size / 1024)} KB). Maximum allowed size is 256 KB.`
+      );
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+      if (!dataUrl.startsWith('data:image/')) {
+        setAdminMsg('Unsupported file format. Please upload a PNG, ICO, SVG, WebP, JPG, or GIF image.');
+        return;
+      }
+      setBoot({
+        ...boot,
+        settings: {
+          ...boot.settings,
+          [field]: dataUrl,
+        },
+      });
+      setAdminMsg(
+        field === 'favicon_icon'
+          ? 'Browser tab favicon loaded for preview. Click "Save Global Settings" to persist.'
+          : 'Public Portal header logo loaded for preview. Click "Save Global Settings" to persist.'
+      );
+    };
+    reader.onerror = () => {
+      setAdminMsg('Failed to read the selected image file.');
+    };
+    reader.readAsDataURL(file);
+  };
 
   const [adminSection, setAdminSection] = useState<'settings' | 'views' | 'rr' | 'users' | 'logs'>(
     'settings'
@@ -794,14 +868,14 @@ export const App: React.FC = () => {
                   badge: boot.settings.access_mode,
                 },
                 {
-                  id: 'views',
-                  label: '2. VRF / Routing Tables',
-                  badge: String(boot.all_views.length),
+                  id: 'rr',
+                  label: '2. PoP Groups & RR Nodes',
+                  badge: `${configuredPOPGroups.length} PoP / ${boot.rr_nodes.length} RR`,
                 },
                 {
-                  id: 'rr',
-                  label: '3. PoP Groups & RR Nodes',
-                  badge: `${configuredPOPGroups.length} PoP / ${boot.rr_nodes.length} RR`,
+                  id: 'views',
+                  label: '3. VRF / Routing Tables',
+                  badge: String(boot.all_views.length),
                 },
                 {
                   id: 'users',
@@ -922,9 +996,15 @@ export const App: React.FC = () => {
                 <form
                   onSubmit={async (e) => {
                     e.preventDefault();
-                    await api.updateSettings(boot.settings);
-                    setAdminMsg('Global settings saved.');
-                    await loadBootstrap();
+                    try {
+                      await api.updateSettings(boot.settings);
+                      setAdminMsg('Global settings saved.');
+                      await loadBootstrap();
+                    } catch (err: unknown) {
+                      setAdminMsg(
+                        err instanceof Error ? err.message : 'Failed to save global settings'
+                      );
+                    }
                   }}
                   className="space-y-4 pt-5 border-t border-slate-200 dark:border-slate-800/70 text-xs"
                 >
@@ -1034,13 +1114,119 @@ export const App: React.FC = () => {
                     </div>
                   </div>
 
+                  {/* BRANDING ICONS: BROWSER TAB FAVICON & PUBLIC PORTAL HEADER LOGO */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className={`p-4 rounded-xl border ${bgSubCard} flex items-center gap-4`}>
+                      <div
+                        className={`w-12 h-12 rounded-xl border flex items-center justify-center shrink-0 overflow-hidden ${bgCard}`}
+                        title="Browser Tab Favicon Preview"
+                      >
+                        <img
+                          src={boot.settings.favicon_icon || DEFAULT_FAVICON_DATA_URL}
+                          alt="Browser Favicon Preview"
+                          className="w-8 h-8 object-contain"
+                        />
+                      </div>
+                      <div className="min-w-0 flex-1 space-y-1.5">
+                        <div className={`font-bold ${textPrimary}`}>
+                          Browser Tab Favicon
+                        </div>
+                        <p className={`text-[11px] ${textSecondary}`}>
+                          Replaces the icon next to the browser tab title (PNG / ICO / SVG / WebP,
+                          max 256 KB).
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                          <label className="cursor-pointer px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold transition inline-flex items-center">
+                            <span>Upload Favicon</span>
+                            <input
+                              type="file"
+                              accept=".png,.ico,.svg,.webp,.jpg,.jpeg,.gif,image/*"
+                              className="hidden"
+                              onChange={(e) => handleIconFileUpload('favicon_icon', e)}
+                            />
+                          </label>
+                          {boot.settings.favicon_icon && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setBoot({
+                                  ...boot,
+                                  settings: { ...boot.settings, favicon_icon: '' },
+                                })
+                              }
+                              className={`px-2.5 py-1.5 rounded-lg border font-medium transition ${badgeRose}`}
+                            >
+                              Reset Default
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className={`p-4 rounded-xl border ${bgSubCard} flex items-center gap-4`}>
+                      {boot.settings.portal_logo ? (
+                        <div
+                          className={`w-12 h-12 rounded-xl border flex items-center justify-center shrink-0 overflow-hidden p-1 ${bgCard}`}
+                          title="Public Portal Header Logo Preview"
+                        >
+                          <img
+                            src={boot.settings.portal_logo}
+                            alt="Public Portal Logo Preview"
+                            className="w-10 h-10 object-contain rounded-lg"
+                          />
+                        </div>
+                      ) : (
+                        <div
+                          className="w-12 h-12 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center font-bold text-sm text-white shadow-md shadow-sky-500/20 shrink-0"
+                          title="Default BGP Logo"
+                        >
+                          BGP
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1 space-y-1.5">
+                        <div className={`font-bold ${textPrimary}`}>
+                          Public Portal Header Logo
+                        </div>
+                        <p className={`text-[11px] ${textSecondary}`}>
+                          Replaces the blue BGP square icon to the left of the Portal Title (PNG /
+                          SVG / WebP, max 256 KB).
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                          <label className="cursor-pointer px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition inline-flex items-center">
+                            <span>Upload Portal Logo</span>
+                            <input
+                              type="file"
+                              accept=".png,.ico,.svg,.webp,.jpg,.jpeg,.gif,image/*"
+                              className="hidden"
+                              onChange={(e) => handleIconFileUpload('portal_logo', e)}
+                            />
+                          </label>
+                          {boot.settings.portal_logo && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setBoot({
+                                  ...boot,
+                                  settings: { ...boot.settings, portal_logo: '' },
+                                })
+                              }
+                              className={`px-2.5 py-1.5 rounded-lg border font-medium transition ${badgeRose}`}
+                            >
+                              Reset Default
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   <div>
                     <label className={`block font-medium mb-2 ${textSecondary}`}>
                       Permitted VRF / Routing Tables in Public Mode:
                     </label>
                     {boot.all_views.length === 0 ? (
                       <div className="text-slate-500 italic">
-                        No VRF views configured yet. Add a VRF table in Section 2 first.
+                        No VRF views configured yet. Add a VRF table in Section 3 first.
                       </div>
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5">
@@ -2749,9 +2935,23 @@ export const App: React.FC = () => {
       <header className={`border-b ${bgHeader} backdrop-blur sticky top-0 z-30`}>
         <div className={`${layoutContainer} py-3.5 flex flex-wrap items-center justify-between gap-4`}>
           <div className="flex items-center gap-3.5">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center font-bold text-sm text-white shadow-lg shadow-sky-500/20">
-              BGP
-            </div>
+            {boot.settings.portal_logo ? (
+              <div
+                className={`w-10 h-10 rounded-xl border flex items-center justify-center overflow-hidden p-0.5 shrink-0 ${
+                  isDark ? 'bg-[#0b101d] border-slate-800' : 'bg-white border-slate-200 shadow-sm'
+                }`}
+              >
+                <img
+                  src={boot.settings.portal_logo}
+                  alt={boot.settings.organization_name}
+                  className="w-full h-full object-contain rounded-lg"
+                />
+              </div>
+            ) : (
+              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center font-bold text-sm text-white shadow-lg shadow-sky-500/20 shrink-0">
+                BGP
+              </div>
+            )}
             <div>
               <div className="flex flex-wrap items-center gap-2.5">
                 <span className={`font-bold text-base tracking-tight ${textPrimary}`}>
