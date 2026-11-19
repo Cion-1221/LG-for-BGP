@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html:not(.dark) {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  html:not(.dark) body {
+    background-color: #f8fafc;
+    color: #0f172a;
+  }
+  html.dark body {
+    background-color: #060911;
+    color: #f1f5f9;
+  }
+}
+
+/* Theme-adaptive text selection so highlighted text is always legible in Light and Dark mode */
+html:not(.dark) ::selection {
+  background-color: #bae6fd;
+  color: #0f172a;
+}
+html.dark ::selection {
+  background-color: rgba(14, 165, 233, 0.35);
+  color: #e0f2fe;
+}
+
+/* Dark CLI output pane keeps high-contrast light selection even in Light mode */
+.cli-terminal::selection,
+.cli-terminal *::selection {
+  background-color: rgba(56, 189, 248, 0.42);
+  color: #ffffff;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+html:not(.dark) ::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+html:not(.dark) ::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+html:not(.dark) ::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+html.dark ::-webkit-scrollbar-track {
+  background: #090d16;
+}
+html.dark ::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 4px;
+}
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}

@@ -17,17 +17,18 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"lg-for-bgp/internal/models"
 )
 
 type PersistentData struct {
-	Settings    models.SystemSettings       `json:"settings"`
-	Users       []models.UserAccount        `json:"users"`
-	Communities []models.CommunityDictEntry `json:"communities"`
-	POPs        []models.POPGroup           `json:"pops"`
-	RRNodes     []models.RRNodeConfig       `json:"rr_nodes"`
-	RouteViews  []models.RouteViewMeta      `json:"route_views"`
-	AuditLogs   []models.AuditLogEntry      `json:"audit_logs"`
+	Settings   models.SystemSettings  `json:"settings"`
+	Users      []models.UserAccount   `json:"users"`
+	POPs       []models.POPGroup      `json:"pops"`
+	RRNodes    []models.RRNodeConfig  `json:"rr_nodes"`
+	RouteViews []models.RouteViewMeta `json:"route_views"`
+	AuditLogs  []models.AuditLogEntry `json:"audit_logs"`
 }
 
 type DBPoolOptions struct {
@@ -40,13 +41,51 @@ type DBPoolOptions struct {
 type AppStore struct {
 	mu                  sync.RWMutex
 	db                  *sql.DB
+	dbDriver            string // "mysql", "sqlite", or "" (file/memory)
 	poolOpts            DBPoolOptions
 	filePath            string
 	jwtSecret           []byte
 	jwtExpiryDays       int
 	bootInstanceID      string // Ephemeral per-process boot ID; invalidates old sessions whenever lg-server restarts
 	configuredAdminSlug string // Loaded from config.yaml (e.g. /admin, /console, etc.)
+	auditRetentionDays  int
+	auditMaxRows        int
+	auditCleanerStarted bool
+	stopCh              chan struct{}
+	closeOnce           sync.Once
 	data                PersistentData
+}
+
+func (s *AppStore) DBDriver() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.dbDriver != "" {
+		return s.dbDriver
+	}
+	if s.filePath == "" || s.filePath == "memory" {
+		return "memory"
+	}
+	return "file"
+}
+
+func (s *AppStore) Close() error {
+	s.closeOnce.Do(func() {
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db != nil {
+		if s.dbDriver == "sqlite" {
+			// Ensure WAL frames are flushed cleanly to the main database file on shutdown
+			_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
+		}
+		err := s.db.Close()
+		s.db = nil
+		return err
+	}
+	return nil
 }
 
 func (s *AppStore) SetJWTConfig(secret string, refreshDays int) {
@@ -64,23 +103,31 @@ func (s *AppStore) SetDBPoolOptions(opts DBPoolOptions) {
 	s.mu.Lock()
 	s.poolOpts = opts
 	if s.db != nil {
-		if opts.MaxOpenConns > 0 {
-			s.db.SetMaxOpenConns(opts.MaxOpenConns)
-		}
-		if opts.MaxIdleConns > 0 {
-			s.db.SetMaxIdleConns(opts.MaxIdleConns)
-		}
-		if opts.ConnMaxLifetimeMinutes > 0 {
-			s.db.SetConnMaxLifetime(time.Duration(opts.ConnMaxLifetimeMinutes) * time.Minute)
-		}
-		if opts.ConnMaxIdleTimeMinutes > 0 {
-			s.db.SetConnMaxIdleTime(time.Duration(opts.ConnMaxIdleTimeMinutes) * time.Minute)
+		if s.dbDriver == "sqlite" {
+			// SQLite works best with a single serialized connection in database/sql to avoid SQLITE_BUSY.
+			s.db.SetMaxOpenConns(1)
+			s.db.SetMaxIdleConns(1)
+			s.db.SetConnMaxLifetime(0)
+			s.db.SetConnMaxIdleTime(0)
+		} else {
+			if opts.MaxOpenConns > 0 {
+				s.db.SetMaxOpenConns(opts.MaxOpenConns)
+			}
+			if opts.MaxIdleConns > 0 {
+				s.db.SetMaxIdleConns(opts.MaxIdleConns)
+			}
+			if opts.ConnMaxLifetimeMinutes > 0 {
+				s.db.SetConnMaxLifetime(time.Duration(opts.ConnMaxLifetimeMinutes) * time.Minute)
+			}
+			if opts.ConnMaxIdleTimeMinutes > 0 {
+				s.db.SetConnMaxIdleTime(time.Duration(opts.ConnMaxIdleTimeMinutes) * time.Minute)
+			}
 		}
 	}
 	s.mu.Unlock()
 }
 
-// SetConfiguredAdminPath sets the admin portal path specified in lg-server.conf.
+// SetConfiguredAdminPath sets the admin portal path specified in config.yaml.
 func (s *AppStore) SetConfiguredAdminPath(adminPath string) {
 	slug := strings.Trim(strings.TrimSpace(adminPath), "/")
 	if slug == "" {
@@ -92,29 +139,40 @@ func (s *AppStore) SetConfiguredAdminPath(adminPath string) {
 	s.mu.Unlock()
 }
 
-// NewAppStore initializes the store using MySQL/MariaDB if a DSN is provided (via LG_DB_DSN or parameter),
-// or falls back to local file store for unit tests / standalone development.
+// NewAppStore initializes the store using MySQL/MariaDB or SQLite3 when a corresponding DSN/path is provided,
+// or falls back to local JSON/in-memory store for unit tests / standalone development.
 func NewAppStore(dsnOrPath string) (*AppStore, error) {
 	secret := os.Getenv("LG_JWT_SECRET")
 	if secret == "" {
 		secret = "open-source-bgp-looking-glass-default-jwt-secret"
 	}
 
-	envDSN := strings.TrimSpace(os.Getenv("LG_DB_DSN"))
-	if envDSN != "" {
-		dsnOrPath = envDSN
+	if strings.TrimSpace(dsnOrPath) == "" {
+		if envDSN := strings.TrimSpace(os.Getenv("LG_DB_DSN")); envDSN != "" {
+			dsnOrPath = envDSN
+		}
 	}
 
 	bootBytes := make([]byte, 16)
 	_, _ = rand.Read(bootBytes)
 
 	s := &AppStore{
-		jwtSecret:      []byte(secret),
-		bootInstanceID: hex.EncodeToString(bootBytes),
+		jwtSecret:          []byte(secret),
+		bootInstanceID:     hex.EncodeToString(bootBytes),
+		auditRetentionDays: 30,
+		auditMaxRows:       50000,
+		stopCh:             make(chan struct{}),
 	}
 
 	if isMySQLDSN(dsnOrPath) {
 		if err := s.initMySQL(dsnOrPath); err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+
+	if isSQLiteDSN(dsnOrPath) {
+		if err := s.initSQLite(dsnOrPath); err != nil {
 			return nil, err
 		}
 		return s, nil
@@ -128,12 +186,61 @@ func NewAppStore(dsnOrPath string) (*AppStore, error) {
 }
 
 func isMySQLDSN(val string) bool {
-	return strings.Contains(val, "@tcp(") || strings.Contains(val, "@unix(") || strings.HasPrefix(val, "mysql://")
+	return strings.Contains(val, "@tcp(") || strings.Contains(val, "@unix(") || strings.HasPrefix(strings.ToLower(strings.TrimSpace(val)), "mysql://")
 }
 
-func HashPassword(password string) string {
+func isSQLiteDSN(val string) bool {
+	v := strings.TrimSpace(val)
+	lower := strings.ToLower(v)
+	if lower == ":memory:" {
+		return true
+	}
+	if strings.HasPrefix(lower, "sqlite://") || strings.HasPrefix(lower, "sqlite:") || strings.HasPrefix(lower, "sqlite3:") {
+		return true
+	}
+	return strings.HasSuffix(lower, ".db") || strings.HasSuffix(lower, ".sqlite") || strings.HasSuffix(lower, ".sqlite3")
+}
+
+// LegacySHA256Hash computes the legacy salted SHA-256 password hash used by earlier versions,
+// kept solely for transparent login migration to bcrypt.
+func LegacySHA256Hash(password string) string {
 	h := sha256.Sum256([]byte("lg-for-bgp-salt:" + password))
 	return hex.EncodeToString(h[:])
+}
+
+// HashPassword hashes a plaintext password using bcrypt (salted, adaptive work factor).
+func HashPassword(password string) string {
+	// bcrypt truncates/errors past 72 bytes; pre-digest overly long passphrases consistently
+	pwBytes := []byte(password)
+	if len(pwBytes) > 72 {
+		sum := sha256.Sum256(pwBytes)
+		pwBytes = []byte("sha256:" + hex.EncodeToString(sum[:]))
+	}
+	hashed, err := bcrypt.GenerateFromPassword(pwBytes, bcrypt.DefaultCost)
+	if err != nil {
+		// Unreachable for <=72-byte input, defensive fallback
+		return LegacySHA256Hash(password)
+	}
+	return string(hashed)
+}
+
+// VerifyPassword verifies a plaintext password against a stored bcrypt or legacy SHA-256 hash.
+// Returns (matched, needsUpgrade) where needsUpgrade is true when a legacy hash matched and should be upgraded to bcrypt.
+func VerifyPassword(storedHash, password string) (bool, bool) {
+	if strings.HasPrefix(storedHash, "$2a$") || strings.HasPrefix(storedHash, "$2b$") || strings.HasPrefix(storedHash, "$2y$") {
+		pwBytes := []byte(password)
+		if len(pwBytes) > 72 {
+			sum := sha256.Sum256(pwBytes)
+			pwBytes = []byte("sha256:" + hex.EncodeToString(sum[:]))
+		}
+		return bcrypt.CompareHashAndPassword([]byte(storedHash), pwBytes) == nil, false
+	}
+	// Legacy SHA-256 verification with constant-time comparison
+	legacy := LegacySHA256Hash(password)
+	if hmac.Equal([]byte(storedHash), []byte(legacy)) {
+		return true, true
+	}
+	return false, false
 }
 
 func defaultInitialData() PersistentData {
@@ -178,8 +285,7 @@ func defaultInitialData() PersistentData {
 				CreatedAt:          now,
 			},
 		},
-		Communities: []models.CommunityDictEntry{},
-		AuditLogs:   []models.AuditLogEntry{},
+		AuditLogs: []models.AuditLogEntry{},
 	}
 }
 
@@ -191,10 +297,11 @@ func (s *AppStore) loadOrInitFile() error {
 		if _, err := os.Stat(s.filePath); err == nil {
 			raw, errRead := os.ReadFile(s.filePath)
 			if errRead == nil {
-				if errUnmarshal := json.Unmarshal(raw, &s.data); errUnmarshal == nil && len(s.data.RouteViews) > 0 {
+				if errUnmarshal := json.Unmarshal(raw, &s.data); errUnmarshal == nil && len(s.data.Users) > 0 {
 					if s.data.Settings.AdminSecretSlug == "" {
-						s.data.Settings.AdminSecretSlug = "_console_8f92a1c4"
+						s.data.Settings.AdminSecretSlug = "console"
 					}
+					s.migrateLegacyViewBindingsLocked()
 					return nil
 				}
 			}
@@ -202,13 +309,10 @@ func (s *AppStore) loadOrInitFile() error {
 	}
 
 	s.data = defaultInitialData()
-	return s.persistLocked()
+	return s.persistFileLocked()
 }
 
-func (s *AppStore) persistLocked() error {
-	if s.db != nil {
-		return s.syncAllToMySQLLocked()
-	}
+func (s *AppStore) persistFileLocked() error {
 	if s.filePath == "" || s.filePath == "memory" {
 		return nil
 	}
@@ -250,7 +354,7 @@ func (s *AppStore) GetSettings() models.SystemSettings {
 	return s.GetPublicSettings()
 }
 
-// VerifyAdminSlug performs constant-time comparison of the candidate URL slug against the admin path in lg-server.conf.
+// VerifyAdminSlug performs constant-time comparison of the candidate URL slug against the admin path in config.yaml.
 func (s *AppStore) VerifyAdminSlug(candidate string) bool {
 	candidate = strings.Trim(strings.TrimSpace(candidate), "/")
 	if candidate == "" {
@@ -284,7 +388,7 @@ func (s *AppStore) UpdateSettings(newSettings models.SystemSettings) (models.Sys
 		newSettings.AdminSecretSlug = s.data.Settings.AdminSecretSlug
 	}
 	s.data.Settings = newSettings
-	err := s.persistLocked()
+	err := s.upsertSettingsDBLocked()
 	return s.data.Settings, err
 }
 
@@ -292,7 +396,15 @@ func (s *AppStore) GetRouteViews() []models.RouteViewMeta {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]models.RouteViewMeta, len(s.data.RouteViews))
-	copy(out, s.data.RouteViews)
+	for i, v := range s.data.RouteViews {
+		cp := v
+		if len(v.RRNodeIDs) > 0 {
+			cp.RRNodeIDs = append([]string(nil), v.RRNodeIDs...)
+		} else {
+			cp.RRNodeIDs = []string{}
+		}
+		out[i] = cp
+	}
 	return out
 }
 
@@ -301,9 +413,143 @@ func (s *AppStore) GetRouteViewMap() map[models.RouteViewID]models.RouteViewMeta
 	defer s.mu.RUnlock()
 	m := make(map[models.RouteViewID]models.RouteViewMeta, len(s.data.RouteViews))
 	for _, v := range s.data.RouteViews {
-		m[v.ID] = v
+		cp := v
+		if len(v.RRNodeIDs) > 0 {
+			cp.RRNodeIDs = append([]string(nil), v.RRNodeIDs...)
+		} else {
+			cp.RRNodeIDs = []string{}
+		}
+		m[v.ID] = cp
 	}
 	return m
+}
+
+func sanitizeIDSlug(val string) string {
+	val = strings.ToLower(strings.TrimSpace(val))
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range val {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastUnderscore = false
+		} else if !lastUnderscore && b.Len() > 0 {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+func normalizeRRNodeIDs(raw []string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, id := range raw {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		if strings.EqualFold(trimmed, "all") {
+			return []string{"all"}
+		}
+		if !seen[trimmed] {
+			seen[trimmed] = true
+			out = append(out, trimmed)
+		}
+	}
+	if out == nil {
+		return []string{}
+	}
+	return out
+}
+
+func normalizeLoadedRouteView(v *models.RouteViewMeta) {
+	v.POP = strings.TrimSpace(v.POP)
+	if v.POP == "" {
+		v.POP = "all"
+	}
+	v.RRNodeIDs = normalizeRRNodeIDs(v.RRNodeIDs)
+	v.Type = strings.ToLower(strings.TrimSpace(v.Type))
+	if v.Type != "auto" && v.Type != "gobgp" && v.Type != "bird2" && v.Type != "frr" {
+		v.Type = "auto"
+	}
+	v.VRFName = strings.TrimSpace(v.VRFName)
+	if v.VRFName == "" || strings.EqualFold(v.VRFName, "global") || strings.EqualFold(v.VRFName, "default") || strings.EqualFold(v.VRFName, "master") {
+		v.VRFName = "global"
+		v.ShortName = "GLOBAL"
+		v.JunosContextType = "global-rib"
+		v.JunosContextName = "global"
+		v.JunosTable = "inet.0 / inet6.0 (Global RIB)"
+	} else {
+		v.ShortName = v.VRFName
+		v.JunosContextType = "routing-instances"
+		v.JunosContextName = v.VRFName
+		v.JunosTable = v.VRFName + ".inet.0"
+	}
+	v.BirdTableV4 = v.VRFName
+	v.FrrViewName = v.VRFName
+}
+
+// migrateLegacyViewBindingsLocked backfills RRNodeIDs for pre-existing VRFs created before VRF<->RR binding existed.
+func (s *AppStore) migrateLegacyViewBindingsLocked() bool {
+	changed := false
+	for i := range s.data.RouteViews {
+		v := &s.data.RouteViews[i]
+		if len(v.RRNodeIDs) > 0 {
+			continue
+		}
+		pop := strings.TrimSpace(v.POP)
+		if pop == "" || strings.EqualFold(pop, "all") {
+			v.RRNodeIDs = []string{"all"}
+			changed = true
+			continue
+		}
+		var matchedRRs []string
+		for _, n := range s.data.RRNodes {
+			if strings.EqualFold(strings.TrimSpace(n.Location), pop) {
+				matchedRRs = append(matchedRRs, n.ID)
+			}
+		}
+		if len(matchedRRs) > 0 {
+			v.RRNodeIDs = matchedRRs
+			changed = true
+		}
+	}
+	return changed
+}
+
+// deriveViewPOPLocked derives the legacy POP label from bound RRNodeIDs for display/compatibility.
+func (s *AppStore) deriveViewPOPLocked(rrNodeIDs []string, fallbackPOP string) string {
+	if len(rrNodeIDs) == 1 && strings.EqualFold(rrNodeIDs[0], "all") {
+		return "all"
+	}
+	if len(rrNodeIDs) == 0 {
+		if p := strings.TrimSpace(fallbackPOP); p != "" {
+			return p
+		}
+		return "none"
+	}
+	rrMap := make(map[string]models.RRNodeConfig, len(s.data.RRNodes))
+	for _, n := range s.data.RRNodes {
+		rrMap[n.ID] = n
+	}
+	popSet := make(map[string]string)
+	for _, id := range rrNodeIDs {
+		if n, ok := rrMap[id]; ok && strings.TrimSpace(n.Location) != "" {
+			popSet[strings.ToUpper(strings.TrimSpace(n.Location))] = strings.TrimSpace(n.Location)
+		}
+	}
+	if len(popSet) == 1 {
+		for _, p := range popSet {
+			return p
+		}
+	}
+	if len(popSet) > 1 {
+		return "multi"
+	}
+	if p := strings.TrimSpace(fallbackPOP); p != "" {
+		return p
+	}
+	return "all"
 }
 
 func (s *AppStore) UpsertRouteView(view models.RouteViewMeta) error {
@@ -314,17 +560,72 @@ func (s *AppStore) UpsertRouteView(view models.RouteViewMeta) error {
 	if view.VRFName == "" || strings.EqualFold(view.VRFName, "global") || strings.EqualFold(view.VRFName, "default") || strings.EqualFold(view.VRFName, "master") {
 		view.VRFName = "global"
 	}
-	if strings.TrimSpace(string(view.ID)) == "" {
-		slug := strings.ToLower(strings.ReplaceAll(view.VRFName, "-", "_"))
-		if slug == "global" {
-			slug = fmt.Sprintf("global_%s", strings.ToLower(strings.TrimSpace(view.Type)))
-		}
-		view.ID = models.RouteViewID(slug)
-	}
 	view.Type = strings.ToLower(strings.TrimSpace(view.Type))
-	if view.Type != "gobgp" && view.Type != "bird2" && view.Type != "frr" {
-		view.Type = "gobgp"
+	if view.Type != "auto" && view.Type != "gobgp" && view.Type != "bird2" && view.Type != "frr" {
+		view.Type = "auto"
 	}
+
+	view.RRNodeIDs = normalizeRRNodeIDs(view.RRNodeIDs)
+	// Backwards-compatible fallback when caller sets POP without RRNodeIDs
+	if len(view.RRNodeIDs) == 0 {
+		p := strings.TrimSpace(view.POP)
+		if p == "" || strings.EqualFold(p, "all") {
+			view.RRNodeIDs = []string{"all"}
+		} else {
+			for _, n := range s.data.RRNodes {
+				if strings.EqualFold(strings.TrimSpace(n.Location), p) {
+					view.RRNodeIDs = append(view.RRNodeIDs, n.ID)
+				}
+			}
+		}
+	}
+
+	view.POP = s.deriveViewPOPLocked(view.RRNodeIDs, view.POP)
+
+	if strings.TrimSpace(string(view.ID)) == "" {
+		slug := sanitizeIDSlug(view.VRFName)
+		if slug == "" || slug == "global" {
+			slug = "global_rib"
+		}
+		if len(view.RRNodeIDs) == 1 && !strings.EqualFold(view.RRNodeIDs[0], "all") {
+			if rrSlug := sanitizeIDSlug(view.RRNodeIDs[0]); rrSlug != "" {
+				slug = rrSlug + "_" + slug
+			}
+		} else if view.POP != "" && !strings.EqualFold(view.POP, "all") && !strings.EqualFold(view.POP, "multi") && !strings.EqualFold(view.POP, "none") {
+			if popSlug := sanitizeIDSlug(view.POP); popSlug != "" {
+				slug = popSlug + "_" + slug
+			}
+		}
+		if len(slug) > 64 {
+			slug = strings.TrimRight(slug[:64], "_")
+		}
+		// Ensure auto-generated ID doesn't accidentally overwrite an unrelated existing view
+		candidate := models.RouteViewID(slug)
+		exists := func(id models.RouteViewID) bool {
+			for _, ex := range s.data.RouteViews {
+				if ex.ID == id {
+					return true
+				}
+			}
+			return false
+		}
+		if exists(candidate) {
+			for n := 2; n < 100; n++ {
+				suffix := fmt.Sprintf("_%d", n)
+				base := slug
+				if len(base)+len(suffix) > 64 {
+					base = base[:64-len(suffix)]
+				}
+				alt := models.RouteViewID(base + suffix)
+				if !exists(alt) {
+					candidate = alt
+					break
+				}
+			}
+		}
+		view.ID = candidate
+	}
+
 	if view.ShortName == "" {
 		if view.VRFName == "global" {
 			view.ShortName = "GLOBAL"
@@ -351,23 +652,24 @@ func (s *AppStore) UpsertRouteView(view models.RouteViewMeta) error {
 	}
 	view.BirdTableV4 = view.VRFName
 	view.FrrViewName = view.VRFName
-	view.POP = strings.TrimSpace(view.POP)
-	if view.POP == "" {
-		view.POP = "all"
-	}
-	if view.JuniperSourceIPv4 == "" {
-		view.JuniperSourceIPv4 = "10.255.0.10"
-	}
+	view.JuniperSourceIPv4 = strings.TrimSpace(view.JuniperSourceIPv4)
 
 	for i, existing := range s.data.RouteViews {
 		if existing.ID == view.ID {
 			s.data.RouteViews[i] = view
-			s.pruneStaleViewIDsLocked()
-			return s.persistLocked()
+			if err := s.upsertRouteViewDBLocked(view, i); err != nil {
+				return err
+			}
+			if s.pruneStaleViewIDsLocked() {
+				return s.syncAllowedViewsDBLocked()
+			}
+			return nil
 		}
 	}
+
+	idx := len(s.data.RouteViews)
 	s.data.RouteViews = append(s.data.RouteViews, view)
-	// Also append to PublicAllowedViews and admin AllowedViews by default so new VRFs are immediately queryable
+	// Also append to PublicAllowedViews and admin/noc AllowedViews by default so new VRFs are immediately queryable
 	s.data.Settings.PublicAllowedViews = append(s.data.Settings.PublicAllowedViews, view.ID)
 	for i := range s.data.Users {
 		if s.data.Users[i].Role == "admin" || s.data.Users[i].Role == "noc" {
@@ -375,12 +677,16 @@ func (s *AppStore) UpsertRouteView(view models.RouteViewMeta) error {
 		}
 	}
 	s.pruneStaleViewIDsLocked()
-	return s.persistLocked()
+	if err := s.upsertRouteViewDBLocked(view, idx); err != nil {
+		return err
+	}
+	return s.syncAllowedViewsDBLocked()
 }
 
 // pruneStaleViewIDsLocked removes any deleted/non-existent VRF view IDs from PublicAllowedViews and all user accounts,
 // and ensures admin accounts always have the exact list of currently existing VRF views.
-func (s *AppStore) pruneStaleViewIDsLocked() {
+// Returns true if any list was modified.
+func (s *AppStore) pruneStaleViewIDsLocked() bool {
 	validSet := make(map[models.RouteViewID]bool, len(s.data.RouteViews))
 	allIDs := make([]models.RouteViewID, 0, len(s.data.RouteViews))
 	for _, v := range s.data.RouteViews {
@@ -388,21 +694,37 @@ func (s *AppStore) pruneStaleViewIDsLocked() {
 		allIDs = append(allIDs, v.ID)
 	}
 
+	changed := false
 	var cleanPub []models.RouteViewID
 	seenPub := make(map[models.RouteViewID]bool)
 	for _, id := range s.data.Settings.PublicAllowedViews {
 		if validSet[id] && !seenPub[id] {
 			cleanPub = append(cleanPub, id)
 			seenPub[id] = true
+		} else {
+			changed = true
 		}
 	}
 	if cleanPub == nil {
 		cleanPub = []models.RouteViewID{}
 	}
+	if len(cleanPub) != len(s.data.Settings.PublicAllowedViews) {
+		changed = true
+	}
 	s.data.Settings.PublicAllowedViews = cleanPub
 
 	for i := range s.data.Users {
 		if s.data.Users[i].Role == "admin" {
+			if len(s.data.Users[i].AllowedViews) != len(allIDs) {
+				changed = true
+			} else {
+				for j := range allIDs {
+					if s.data.Users[i].AllowedViews[j] != allIDs[j] {
+						changed = true
+						break
+					}
+				}
+			}
 			cp := make([]models.RouteViewID, len(allIDs))
 			copy(cp, allIDs)
 			s.data.Users[i].AllowedViews = cp
@@ -414,6 +736,8 @@ func (s *AppStore) pruneStaleViewIDsLocked() {
 			if validSet[id] && !seenUser[id] {
 				cleanUserViews = append(cleanUserViews, id)
 				seenUser[id] = true
+			} else {
+				changed = true
 			}
 		}
 		if cleanUserViews == nil {
@@ -421,6 +745,7 @@ func (s *AppStore) pruneStaleViewIDsLocked() {
 		}
 		s.data.Users[i].AllowedViews = cleanUserViews
 	}
+	return changed
 }
 
 func (s *AppStore) DeleteRouteView(id models.RouteViewID) error {
@@ -435,9 +760,12 @@ func (s *AppStore) DeleteRouteView(id models.RouteViewID) error {
 	s.data.RouteViews = filtered
 	s.pruneStaleViewIDsLocked()
 	if s.db != nil {
-		_, _ = s.db.Exec("DELETE FROM lg_vrfs WHERE id = ?", string(id))
+		if _, err := s.db.Exec("DELETE FROM lg_vrfs WHERE id = ?", string(id)); err != nil {
+			return err
+		}
+		return s.syncAllowedViewsDBLocked()
 	}
-	return s.persistLocked()
+	return s.persistFileLocked()
 }
 
 func (s *AppStore) GetPOPs() []models.POPGroup {
@@ -448,11 +776,12 @@ func (s *AppStore) GetPOPs() []models.POPGroup {
 	return out
 }
 
-func (s *AppStore) ensurePOPsFromRRNodesLocked() {
+func (s *AppStore) ensurePOPsFromRRNodesLocked() []models.POPGroup {
 	seen := make(map[string]bool, len(s.data.POPs))
 	for _, p := range s.data.POPs {
 		seen[strings.ToUpper(strings.TrimSpace(p.ID))] = true
 	}
+	var added []models.POPGroup
 	for _, n := range s.data.RRNodes {
 		loc := strings.TrimSpace(n.Location)
 		if loc == "" {
@@ -461,14 +790,17 @@ func (s *AppStore) ensurePOPsFromRRNodesLocked() {
 		key := strings.ToUpper(loc)
 		if !seen[key] {
 			seen[key] = true
-			s.data.POPs = append(s.data.POPs, models.POPGroup{
+			newPOP := models.POPGroup{
 				ID:          loc,
 				Name:        loc,
 				Description: "",
 				SortOrder:   len(s.data.POPs) + 1,
-			})
+			}
+			s.data.POPs = append(s.data.POPs, newPOP)
+			added = append(added, newPOP)
 		}
 	}
+	return added
 }
 
 func (s *AppStore) UpsertPOP(pop models.POPGroup) error {
@@ -492,17 +824,28 @@ func (s *AppStore) UpsertPOP(pop models.POPGroup) error {
 		if strings.EqualFold(existing.ID, pop.ID) {
 			pop.ID = existing.ID
 			s.data.POPs[i] = pop
-			return s.persistLocked()
+			return s.upsertPOPDBLocked(pop, i+1)
 		}
 	}
 	s.data.POPs = append(s.data.POPs, pop)
-	return s.persistLocked()
+	return s.upsertPOPDBLocked(pop, len(s.data.POPs))
 }
 
 func (s *AppStore) DeletePOP(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id = strings.TrimSpace(id)
+	// Enforce strict RR -> 1 PoP invariant: cannot delete a PoP while RRs are still bound to it
+	boundCount := 0
+	for _, n := range s.data.RRNodes {
+		if strings.EqualFold(strings.TrimSpace(n.Location), id) {
+			boundCount++
+		}
+	}
+	if boundCount > 0 {
+		return fmt.Errorf("cannot delete PoP %q: %d RR node(s) are still bound to this PoP; reassign or delete those RR nodes first", id, boundCount)
+	}
+
 	var filtered []models.POPGroup
 	for _, p := range s.data.POPs {
 		if !strings.EqualFold(p.ID, id) {
@@ -511,9 +854,10 @@ func (s *AppStore) DeletePOP(id string) error {
 	}
 	s.data.POPs = filtered
 	if s.db != nil {
-		_, _ = s.db.Exec("DELETE FROM lg_pops WHERE id = ?", id)
+		_, err := s.db.Exec("DELETE FROM lg_pops WHERE id = ?", id)
+		return err
 	}
-	return s.persistLocked()
+	return s.persistFileLocked()
 }
 
 func (s *AppStore) GetRRNodes() []models.RRNodeConfig {
@@ -521,6 +865,19 @@ func (s *AppStore) GetRRNodes() []models.RRNodeConfig {
 	defer s.mu.RUnlock()
 	out := make([]models.RRNodeConfig, len(s.data.RRNodes))
 	copy(out, s.data.RRNodes)
+	return out
+}
+
+// GetPublicRRNodes returns RR nodes with sensitive AgentToken fields stripped out.
+func (s *AppStore) GetPublicRRNodes() []models.RRNodeConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]models.RRNodeConfig, len(s.data.RRNodes))
+	for i, n := range s.data.RRNodes {
+		cp := n
+		cp.AgentToken = ""
+		out[i] = cp
+	}
 	return out
 }
 
@@ -550,6 +907,7 @@ func (s *AppStore) UpsertRRNode(node models.RRNodeConfig) error {
 			node.Endpoint = "/run/frr"
 		}
 	}
+	node.AgentToken = strings.TrimSpace(node.AgentToken)
 	node.LoopbackIP = strings.TrimSpace(node.LoopbackIP)
 	if node.LoopbackIP == "" {
 		node.LoopbackIP = "127.0.0.1"
@@ -559,7 +917,7 @@ func (s *AppStore) UpsertRRNode(node models.RRNodeConfig) error {
 		node.Role = "primary"
 	}
 	node.Location = strings.TrimSpace(node.Location)
-	if node.Location == "" {
+	if node.Location == "" || strings.EqualFold(node.Location, "all") {
 		if len(s.data.POPs) > 0 {
 			node.Location = s.data.POPs[0].ID
 		} else {
@@ -569,16 +927,55 @@ func (s *AppStore) UpsertRRNode(node models.RRNodeConfig) error {
 	if node.LastChecked == "" {
 		node.LastChecked = time.Now().Format(time.RFC3339)
 	}
+
+	updated := false
 	for i, existing := range s.data.RRNodes {
 		if existing.ID == node.ID {
 			s.data.RRNodes[i] = node
-			s.ensurePOPsFromRRNodesLocked()
-			return s.persistLocked()
+			updated = true
+			break
 		}
 	}
-	s.data.RRNodes = append(s.data.RRNodes, node)
-	s.ensurePOPsFromRRNodesLocked()
-	return s.persistLocked()
+	if !updated {
+		s.data.RRNodes = append(s.data.RRNodes, node)
+	}
+
+	addedPOPs := s.ensurePOPsFromRRNodesLocked()
+	if err := s.upsertRRNodeDBLocked(node); err != nil {
+		return err
+	}
+	for _, p := range addedPOPs {
+		_ = s.upsertPOPDBLocked(p, p.SortOrder)
+	}
+	// Refresh derived POP metadata on any VRFs bound to this RR
+	for idx := range s.data.RouteViews {
+		v := &s.data.RouteViews[idx]
+		for _, rid := range v.RRNodeIDs {
+			if rid == node.ID {
+				nextPOP := s.deriveViewPOPLocked(v.RRNodeIDs, v.POP)
+				if nextPOP != v.POP {
+					v.POP = nextPOP
+					_ = s.upsertRouteViewDBLocked(*v, idx)
+				}
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// UpdateRRNodeHealth incrementally updates only healthy + last_checked for a single RR node.
+func (s *AppStore) UpdateRRNodeHealth(id string, healthy bool, lastChecked string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.RRNodes {
+		if s.data.RRNodes[i].ID == id {
+			s.data.RRNodes[i].Healthy = healthy
+			s.data.RRNodes[i].LastChecked = lastChecked
+			return s.updateRRNodeHealthDBLocked(id, healthy, lastChecked)
+		}
+	}
+	return fmt.Errorf("RR node %q not found", id)
 }
 
 func (s *AppStore) DeleteRRNode(id string) error {
@@ -591,47 +988,45 @@ func (s *AppStore) DeleteRRNode(id string) error {
 		}
 	}
 	s.data.RRNodes = filtered
-	if s.db != nil {
-		_, _ = s.db.Exec("DELETE FROM lg_rr_nodes WHERE id = ?", id)
-	}
-	return s.persistLocked()
-}
 
-func (s *AppStore) GetCommunities() []models.CommunityDictEntry {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]models.CommunityDictEntry, len(s.data.Communities))
-	copy(out, s.data.Communities)
-	return out
-}
-
-func (s *AppStore) UpsertCommunity(entry models.CommunityDictEntry) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i, c := range s.data.Communities {
-		if c.Community == entry.Community {
-			s.data.Communities[i] = entry
-			return s.persistLocked()
+	// Remove deleted RR ID from any VRF's RRNodeIDs so no dangling RR reference remains
+	var modifiedViewIdxs []int
+	for idx := range s.data.RouteViews {
+		v := &s.data.RouteViews[idx]
+		if len(v.RRNodeIDs) == 0 || (len(v.RRNodeIDs) == 1 && strings.EqualFold(v.RRNodeIDs[0], "all")) {
+			continue
+		}
+		var kept []string
+		removed := false
+		for _, rid := range v.RRNodeIDs {
+			if rid == id {
+				removed = true
+				continue
+			}
+			kept = append(kept, rid)
+		}
+		if removed {
+			if kept == nil {
+				kept = []string{}
+			}
+			v.RRNodeIDs = kept
+			v.POP = s.deriveViewPOPLocked(v.RRNodeIDs, "none")
+			modifiedViewIdxs = append(modifiedViewIdxs, idx)
 		}
 	}
-	s.data.Communities = append(s.data.Communities, entry)
-	return s.persistLocked()
-}
 
-func (s *AppStore) DeleteCommunity(community string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var filtered []models.CommunityDictEntry
-	for _, c := range s.data.Communities {
-		if c.Community != community {
-			filtered = append(filtered, c)
-		}
-	}
-	s.data.Communities = filtered
 	if s.db != nil {
-		_, _ = s.db.Exec("DELETE FROM lg_communities WHERE community = ?", community)
+		if _, err := s.db.Exec("DELETE FROM lg_rr_nodes WHERE id = ?", id); err != nil {
+			return err
+		}
+		for _, idx := range modifiedViewIdxs {
+			if err := s.upsertRouteViewDBLocked(s.data.RouteViews[idx], idx); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	return s.persistLocked()
+	return s.persistFileLocked()
 }
 
 func (s *AppStore) GetUsers() []models.UserAccount {
@@ -650,23 +1045,29 @@ func (s *AppStore) Authenticate(username, password string) (*models.UserAccount,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	hash := HashPassword(password)
 	for i := range s.data.Users {
 		u := &s.data.Users[i]
 		if strings.EqualFold(u.Username, username) {
 			if !u.Enabled {
 				return nil, "", errors.New("account has been disabled by administrator")
 			}
-			if u.PasswordHash != hash {
+			ok, needsUpgrade := VerifyPassword(u.PasswordHash, password)
+			if !ok {
 				return nil, "", errors.New("invalid username or password")
+			}
+			if needsUpgrade {
+				// Transparent zero-downtime upgrade from legacy SHA-256 to salted bcrypt
+				u.PasswordHash = HashPassword(password)
+				_ = s.updateUserPasswordDBLocked(u.ID, u.PasswordHash, u.MustChangePassword)
+				log.Printf("[AUTH] Upgraded legacy password hash to bcrypt for user %q", u.Username)
 			}
 			now := time.Now()
 			u.LastLoginAt = &now
-			_ = s.persistLocked()
+			_ = s.updateUserLastLoginDBLocked(u.ID, now)
 
 			uSafe := *u
+			token, err := s.issueTokenWithHashLocked(uSafe, u.PasswordHash)
 			uSafe.PasswordHash = ""
-			token, err := s.IssueToken(uSafe)
 			return &uSafe, token, err
 		}
 	}
@@ -706,7 +1107,7 @@ func (s *AppStore) SaveUser(account models.UserAccount, rawPassword string) (*mo
 			}
 			s.data.Users[i] = account
 			s.pruneStaleViewIDsLocked()
-			if err := s.persistLocked(); err != nil {
+			if err := s.upsertUserDBLocked(s.data.Users[i]); err != nil {
 				return nil, err
 			}
 			out := s.data.Users[i]
@@ -725,10 +1126,11 @@ func (s *AppStore) SaveUser(account models.UserAccount, rawPassword string) (*mo
 	account.CreatedAt = time.Now()
 	s.data.Users = append(s.data.Users, account)
 	s.pruneStaleViewIDsLocked()
-	if err := s.persistLocked(); err != nil {
+	saved := s.data.Users[len(s.data.Users)-1]
+	if err := s.upsertUserDBLocked(saved); err != nil {
 		return nil, err
 	}
-	out := s.data.Users[len(s.data.Users)-1]
+	out := saved
 	out.PasswordHash = ""
 	return &out, nil
 }
@@ -743,16 +1145,16 @@ func (s *AppStore) ChangePassword(username, currentPassword, newPassword string)
 		return nil, "", errors.New("new password must be at least 6 characters long")
 	}
 
-	curHash := HashPassword(currentPassword)
 	for i := range s.data.Users {
 		u := &s.data.Users[i]
 		if strings.EqualFold(u.Username, username) {
-			if u.PasswordHash != curHash {
+			ok, _ := VerifyPassword(u.PasswordHash, currentPassword)
+			if !ok {
 				return nil, "", errors.New("current password is incorrect")
 			}
 			u.PasswordHash = HashPassword(newPassword)
 			u.MustChangePassword = false
-			if err := s.persistLocked(); err != nil {
+			if err := s.updateUserPasswordDBLocked(u.ID, u.PasswordHash, false); err != nil {
 				return nil, "", err
 			}
 			uSafe := *u
@@ -779,9 +1181,10 @@ func (s *AppStore) DeleteUser(userID string) error {
 	}
 	s.data.Users = filtered
 	if s.db != nil {
-		_, _ = s.db.Exec("DELETE FROM lg_users WHERE id = ?", userID)
+		_, err := s.db.Exec("DELETE FROM lg_users WHERE id = ?", userID)
+		return err
 	}
-	return s.persistLocked()
+	return s.persistFileLocked()
 }
 
 func (s *AppStore) AppendAuditLog(entry models.AuditLogEntry) {
@@ -798,9 +1201,9 @@ func (s *AppStore) AppendAuditLog(entry models.AuditLogEntry) {
 		_, _ = s.db.Exec(`
 			INSERT INTO lg_audit_logs (timestamp, username, client_ip, action, query_type, target, views, rr_node, duration_ms)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, entry.Timestamp, entry.Username, entry.ClientIP, entry.Action, entry.QueryType, entry.Target, entry.Views, entry.RRNode, entry.DurationMs)
+		`, s.dbTimeArg(entry.Timestamp), entry.Username, entry.ClientIP, entry.Action, entry.QueryType, entry.Target, entry.Views, entry.RRNode, entry.DurationMs)
 	} else {
-		_ = s.persistLocked()
+		_ = s.persistFileLocked()
 	}
 }
 
@@ -821,10 +1224,8 @@ type tokenPayload struct {
 }
 
 func (s *AppStore) pwdTagOf(hash string) string {
-	if len(hash) >= 12 {
-		return hash[:12]
-	}
-	return hash
+	sum := sha256.Sum256([]byte(hash))
+	return hex.EncodeToString(sum[:6])
 }
 
 func (s *AppStore) IssueToken(user models.UserAccount) (string, error) {

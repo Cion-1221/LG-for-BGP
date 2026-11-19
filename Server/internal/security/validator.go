@@ -21,8 +21,8 @@ var (
 	// Explicitly forbids shell metacharacters (; | & ` $ ( ) \ ' " < > % \n \r)
 	reSafeASPath = regexp.MustCompile(`^[0-9_\^\$\.\*\+\?\[\]\s\-]{1,64}$`)
 
-	// Strict identifier format for RouteViewID
-	reViewID = regexp.MustCompile(`^[a-zA-Z0-9_\-]{1,32}$`)
+	// Strict identifier format for RouteViewID (matches DB VARCHAR(64))
+	reViewID = regexp.MustCompile(`^[a-zA-Z0-9_\-]{1,64}$`)
 
 	// Shell & control characters that are unconditionally rejected at the boundary
 	forbiddenChars = ";|&`$()<>\\\"'%\n\r\t\x00"
@@ -172,20 +172,53 @@ func ValidateRouteViews(requested []models.RouteViewID, allowed []models.RouteVi
 	return result, nil
 }
 
-// TTLCache provides a fast thread-safe in-memory cache for BGP queries.
+// TTLCache provides a fast, bounded, thread-safe in-memory cache for BGP queries
+// with automatic background expiration sweeping to prevent memory leaks.
 type cacheItem struct {
 	value     models.ViewQueryResult
 	expiresAt time.Time
 }
 
 type TTLCache struct {
-	mu    sync.RWMutex
-	items map[string]cacheItem
+	mu        sync.RWMutex
+	items     map[string]cacheItem
+	maxItems  int
+	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
 func NewTTLCache() *TTLCache {
-	return &TTLCache{
-		items: make(map[string]cacheItem),
+	c := &TTLCache{
+		items:    make(map[string]cacheItem),
+		maxItems: 4096,
+		stopCh:   make(chan struct{}),
+	}
+	go c.gcLoop()
+	return c
+}
+
+func (c *TTLCache) Close() {
+	c.closeOnce.Do(func() {
+		close(c.stopCh)
+	})
+}
+
+func (c *TTLCache) gcLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case now := <-ticker.C:
+			c.mu.Lock()
+			for k, item := range c.items {
+				if now.After(item.expiresAt) {
+					delete(c.items, k)
+				}
+			}
+			c.mu.Unlock()
+		}
 	}
 }
 
@@ -205,10 +238,41 @@ func (c *TTLCache) Set(key string, val models.ViewQueryResult, ttl time.Duration
 	if ttl <= 0 {
 		return
 	}
+	now := time.Now()
 	c.mu.Lock()
+	if len(c.items) >= c.maxItems {
+		// First purge expired entries
+		for k, item := range c.items {
+			if now.After(item.expiresAt) {
+				delete(c.items, k)
+			}
+		}
+		// If still at capacity, evict the soonest-to-expire entries (up to 10%)
+		if len(c.items) >= c.maxItems {
+			evictTarget := c.maxItems / 10
+			if evictTarget < 1 {
+				evictTarget = 1
+			}
+			for i := 0; i < evictTarget && len(c.items) > 0; i++ {
+				var oldestKey string
+				var oldestExp time.Time
+				first := true
+				for k, item := range c.items {
+					if first || item.expiresAt.Before(oldestExp) {
+						oldestKey = k
+						oldestExp = item.expiresAt
+						first = false
+					}
+				}
+				if oldestKey != "" {
+					delete(c.items, oldestKey)
+				}
+			}
+		}
+	}
 	c.items[key] = cacheItem{
 		value:     val,
-		expiresAt: time.Now().Add(ttl),
+		expiresAt: now.Add(ttl),
 	}
 	c.mu.Unlock()
 }
@@ -219,15 +283,55 @@ func (c *TTLCache) Clear() {
 	c.mu.Unlock()
 }
 
-// RateLimiter implements a sliding window per-user / per-IP request rate limiter.
+// RateLimiter implements a sliding window per-user / per-IP request rate limiter
+// with periodic background eviction of idle keys to prevent unbounded memory growth.
 type RateLimiter struct {
-	mu       sync.Mutex
-	requests map[string][]time.Time
+	mu        sync.Mutex
+	requests  map[string][]time.Time
+	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
 func NewRateLimiter() *RateLimiter {
-	return &RateLimiter{
+	rl := &RateLimiter{
 		requests: make(map[string][]time.Time),
+		stopCh:   make(chan struct{}),
+	}
+	go rl.gcLoop()
+	return rl
+}
+
+func (rl *RateLimiter) Close() {
+	rl.closeOnce.Do(func() {
+		close(rl.stopCh)
+	})
+}
+
+func (rl *RateLimiter) gcLoop() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-rl.stopCh:
+			return
+		case now := <-ticker.C:
+			cutoff := now.Add(-2 * time.Minute)
+			rl.mu.Lock()
+			for k, history := range rl.requests {
+				var active []time.Time
+				for _, t := range history {
+					if t.After(cutoff) {
+						active = append(active, t)
+					}
+				}
+				if len(active) == 0 {
+					delete(rl.requests, k)
+				} else {
+					rl.requests[k] = active
+				}
+			}
+			rl.mu.Unlock()
+		}
 	}
 }
 

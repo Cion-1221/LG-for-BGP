@@ -4,8 +4,9 @@ export interface RouteViewMeta {
   id: RouteViewID;
   name: string;
   vrf_name: string;
-  type: 'gobgp' | 'bird2' | 'frr' | string;
+  type: 'auto' | 'gobgp' | 'bird2' | 'frr' | string;
   pop?: string;
+  rr_node_ids?: string[];
   short_name: string;
   junos_context_type: string;
   junos_context_name: string;
@@ -33,6 +34,7 @@ export interface RRNodeConfig {
   engine_type: string;
   loopback_ip: string;
   endpoint: string;
+  agent_token?: string;
   role: string;
   enabled: boolean;
   healthy: boolean;
@@ -127,16 +129,14 @@ export interface UserAccount {
   last_login_at?: string;
 }
 
-export interface CommunityDictEntry {
-  community: string;
-  label: string;
-  category: string;
-  description: string;
-}
-
 export interface BGPNeighborSummary {
+  pop: string;
+  rr_node_id: string;
+  rr_node_name: string;
+  engine_type: string;
   view_id: RouteViewID;
   view_name: string;
+  vrf_name: string;
   junos_context: string;
   neighbor_ip: string;
   peer_asn: number;
@@ -147,6 +147,18 @@ export interface BGPNeighborSummary {
   prefixes_ipv4: number;
   prefixes_ipv6: number;
   updates_received: number;
+}
+
+export interface LoginLockEntry {
+  key: string;
+  type: 'ip' | 'username' | string;
+  value: string;
+  failures: number;
+  max_failures: number;
+  locked: boolean;
+  remaining_seconds: number;
+  last_attempt: string;
+  locked_until?: string;
 }
 
 export interface AuditLogEntry {

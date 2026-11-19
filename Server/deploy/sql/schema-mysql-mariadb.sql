@@ -5,8 +5,8 @@
 -- IMPORTANT ARCHITECTURE NOTE:
 --   - All BGP routing tables and routes are stored EXCLUSIVELY in the RR's
 --     in-memory RIBs (GoBGP Adj-RIB-In / BIRD 2 Tables / FRR Views).
---   - MySQL / MariaDB ONLY stores User Accounts, System Settings, RR Node
---     connection configs, Community dictionary labels, and Audit Logs.
+--   - MySQL / MariaDB ONLY stores User Accounts, System Settings, PoP Groups,
+--     VRF definitions, RR Node connection configs, and Audit Logs.
 -- ==============================================================================
 
 CREATE DATABASE IF NOT EXISTS lg_for_bgp
@@ -41,9 +41,10 @@ CREATE TABLE IF NOT EXISTS lg_vrfs (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(128) NOT NULL,
     vrf_name VARCHAR(128) NOT NULL,
-    type VARCHAR(32) NOT NULL DEFAULT 'gobgp',
+    type VARCHAR(32) NOT NULL DEFAULT 'auto',
     pop VARCHAR(64) NOT NULL DEFAULT 'all',
-    juniper_source_ipv4 VARCHAR(64) NOT NULL DEFAULT '10.255.0.10',
+    rr_node_ids JSON NOT NULL,
+    juniper_source_ipv4 VARCHAR(64) NOT NULL DEFAULT '',
     description TEXT NOT NULL,
     sort_order INT NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS lg_rr_nodes (
     engine_type VARCHAR(32) NOT NULL DEFAULT 'gobgp',
     loopback_ip VARCHAR(64) NOT NULL,
     endpoint VARCHAR(128) NOT NULL,
+    agent_token VARCHAR(255) NOT NULL DEFAULT '',
     role VARCHAR(32) NOT NULL DEFAULT 'primary',
     enabled TINYINT(1) NOT NULL DEFAULT 1,
     healthy TINYINT(1) NOT NULL DEFAULT 1,
@@ -83,13 +85,6 @@ CREATE TABLE IF NOT EXISTS lg_users (
     notes TEXT,
     created_at DATETIME NOT NULL,
     last_login_at DATETIME NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS lg_communities (
-    community VARCHAR(64) PRIMARY KEY,
-    label VARCHAR(255) NOT NULL,
-    category VARCHAR(64) NOT NULL DEFAULT 'upstream',
-    description TEXT NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS lg_audit_logs (

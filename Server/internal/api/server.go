@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,9 +24,11 @@ type Server struct {
 	engine         *bgp.Engine
 	cache          *security.TTLCache
 	rateLimiter    *security.RateLimiter
+	loginGuard     *security.LoginGuard
 	staticDir      string
 	accessLog      bool
 	trustedProxies map[string]bool
+	allowedOrigins []string
 }
 
 func NewServer(st *store.AppStore, eng *bgp.Engine, cache *security.TTLCache, staticDir string, trustedProxies ...string) *Server {
@@ -43,6 +46,7 @@ func NewServer(st *store.AppStore, eng *bgp.Engine, cache *security.TTLCache, st
 		engine:         eng,
 		cache:          cache,
 		rateLimiter:    security.NewRateLimiter(),
+		loginGuard:     security.NewLoginGuard(5, 15*time.Minute, 15*time.Minute),
 		staticDir:      staticDir,
 		accessLog:      true,
 		trustedProxies: tp,
@@ -51,6 +55,19 @@ func NewServer(st *store.AppStore, eng *bgp.Engine, cache *security.TTLCache, st
 
 func (s *Server) SetAccessLog(enabled bool) {
 	s.accessLog = enabled
+}
+
+func (s *Server) SetAllowedOrigins(origins []string) {
+	s.allowedOrigins = origins
+}
+
+func (s *Server) Close() {
+	if s.rateLimiter != nil {
+		s.rateLimiter.Close()
+	}
+	if s.loginGuard != nil {
+		s.loginGuard.Close()
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -64,7 +81,6 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/api/v1/bgp/lookup", s.handleBGPLookup)
 	mux.HandleFunc("/api/v1/bgp/summary", s.handleBGPSummary)
-	mux.HandleFunc("/api/v1/communities", s.handleCommunities)
 
 	mux.HandleFunc("/api/v1/admin/settings", s.handleAdminSettings)
 	mux.HandleFunc("/api/v1/admin/views", s.handleAdminViews)
@@ -72,8 +88,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/admin/rr-nodes", s.handleAdminRRNodes)
 	mux.HandleFunc("/api/v1/admin/rr-nodes/probe", s.handleAdminProbeRRNode)
 	mux.HandleFunc("/api/v1/admin/users", s.handleAdminUsers)
-	mux.HandleFunc("/api/v1/admin/communities", s.handleAdminCommunities)
 	mux.HandleFunc("/api/v1/admin/audit-logs", s.handleAdminAuditLogs)
+	mux.HandleFunc("/api/v1/admin/security/locks", s.handleAdminSecurityLocks)
 	mux.HandleFunc("/api/v1/admin/cache/clear", s.handleAdminClearCache)
 
 	mux.HandleFunc("/", s.handleStaticUI)
@@ -91,12 +107,33 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+func (s *Server) corsOriginFor(origin string) string {
+	if len(s.allowedOrigins) == 0 {
+		return "*"
+	}
+	for _, allowed := range s.allowedOrigins {
+		a := strings.TrimSpace(allowed)
+		if a == "*" {
+			return "*"
+		}
+		if origin != "" && strings.EqualFold(a, origin) {
+			return origin
+		}
+	}
+	return ""
+}
+
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if originHeader := s.corsOriginFor(r.Header.Get("Origin")); originHeader != "" {
+			w.Header().Set("Access-Control-Allow-Origin", originHeader)
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("Referrer-Policy", "no-referrer")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -180,10 +217,11 @@ func (s *Server) resolveAccess(r *http.Request) (user *models.UserAccount, allow
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	settings := s.store.GetSettings()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":  "ok",
-		"service": "lg-for-bgp-server",
-		"asn":     settings.PrimaryASN,
-		"dc":      settings.DatacenterCode,
+		"status":    "ok",
+		"service":   "lg-for-bgp-server",
+		"db_driver": s.store.DBDriver(),
+		"asn":       settings.PrimaryASN,
+		"dc":        settings.DatacenterCode,
 	})
 }
 
@@ -191,16 +229,20 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	hadAuthHeader := strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") && strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")) != ""
 	user := s.currentUser(r)
 	sessionInvalidated := hadAuthHeader && user == nil
+	isAdmin := user != nil && user.Role == "admin"
 
 	var settings models.SystemSettings
-	if user != nil && user.Role == "admin" {
+	var rrNodes []models.RRNodeConfig
+	if isAdmin {
 		settings = s.store.GetAdminSettings()
+		rrNodes = s.store.GetRRNodes()
 	} else {
 		settings = s.store.GetPublicSettings()
+		rrNodes = s.store.GetPublicRRNodes()
 	}
 
 	entrySlug := r.URL.Query().Get("entry")
-	adminEntryVerified := s.store.VerifyAdminSlug(entrySlug) || (user != nil && user.Role == "admin" && entrySlug != "" && entrySlug != "/")
+	adminEntryVerified := s.store.VerifyAdminSlug(entrySlug) || (isAdmin && entrySlug != "" && entrySlug != "/")
 
 	allViews := s.store.GetRouteViews()
 
@@ -234,8 +276,7 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		"permitted_views":      permittedViews,
 		"all_views":            allViews,
 		"pops":                 s.store.GetPOPs(),
-		"rr_nodes":             s.store.GetRRNodes(),
-		"communities":          s.store.GetCommunities(),
+		"rr_nodes":             rrNodes,
 	})
 }
 
@@ -253,20 +294,45 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, token, err := s.store.Authenticate(strings.TrimSpace(body.Username), body.Password)
-	if err != nil {
+	clientIP := s.clientIP(r)
+	uname := strings.TrimSpace(body.Username)
+
+	if allowed, retryAfter, reason := s.loginGuard.Check(clientIP, uname); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		s.store.AppendAuditLog(models.AuditLogEntry{
-			Username: body.Username,
-			ClientIP: s.clientIP(r),
-			Action:   "LOGIN_FAILED",
+			Username: uname,
+			ClientIP: clientIP,
+			Action:   "LOGIN_BLOCKED_RATE_LIMIT",
 		})
-		writeError(w, http.StatusUnauthorized, err.Error())
+		writeError(w, http.StatusTooManyRequests, reason)
 		return
 	}
 
+	user, token, err := s.store.Authenticate(uname, body.Password)
+	if err != nil {
+		lockedNow, remaining, retryAfter := s.loginGuard.RecordFailure(clientIP, uname)
+		action := "LOGIN_FAILED"
+		if lockedNow {
+			action = "LOGIN_LOCKED_OUT"
+		}
+		s.store.AppendAuditLog(models.AuditLogEntry{
+			Username: uname,
+			ClientIP: clientIP,
+			Action:   action,
+		})
+		if lockedNow {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			writeError(w, http.StatusTooManyRequests, fmt.Sprintf("Too many failed login attempts. Account/IP temporarily locked for %d seconds.", retryAfter))
+			return
+		}
+		writeError(w, http.StatusUnauthorized, fmt.Sprintf("%s (%d attempts remaining before temporary lock)", err.Error(), remaining))
+		return
+	}
+
+	s.loginGuard.RecordSuccess(clientIP, uname)
 	s.store.AppendAuditLog(models.AuditLogEntry{
 		Username: user.Username,
-		ClientIP: s.clientIP(r),
+		ClientIP: clientIP,
 		Action:   "LOGIN_SUCCESS",
 	})
 
@@ -390,6 +456,17 @@ func (s *Server) handleBGPLookup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
+	req.POP = strings.TrimSpace(req.POP)
+	if req.POP != "" && !strings.EqualFold(req.POP, "all") && !strings.EqualFold(req.POP, "auto") {
+		allRRs := s.store.GetRRNodes()
+		for _, vid := range validatedViews {
+			vm := knownViews[vid]
+			if !bgp.ViewBelongsToPOP(vm, req.POP, allRRs) {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("route view [%s] is not bound to any active RR node in PoP %q", vid, req.POP))
+				return
+			}
+		}
+	}
 	req.Views = validatedViews
 
 	start := time.Now()
@@ -418,7 +495,7 @@ func (s *Server) handleBGPLookup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBGPSummary(w http.ResponseWriter, r *http.Request) {
-	_, allowedViews, _, errMsg, status := s.resolveAccess(r)
+	user, allowedViews, _, errMsg, status := s.resolveAccess(r)
 	if status != http.StatusOK {
 		writeError(w, status, errMsg)
 		return
@@ -432,20 +509,26 @@ func (s *Server) handleBGPSummary(w http.ResponseWriter, r *http.Request) {
 	allNeighbors := s.engine.GetNeighborSummary()
 	var filtered []models.BGPNeighborSummary
 	for _, n := range allNeighbors {
-		if allowedSet[n.ViewID] {
+		if (user != nil && user.Role == "admin") || allowedSet[n.ViewID] {
 			filtered = append(filtered, n)
 		}
 	}
+	if filtered == nil {
+		filtered = []models.BGPNeighborSummary{}
+	}
+
+	var rrNodes []models.RRNodeConfig
+	if user != nil && user.Role == "admin" {
+		rrNodes = s.store.GetRRNodes()
+	} else {
+		rrNodes = s.store.GetPublicRRNodes()
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"rr_nodes":  s.store.GetRRNodes(),
+		"rr_nodes":  rrNodes,
 		"neighbors": filtered,
 		"timestamp": time.Now(),
 	})
-}
-
-func (s *Server) handleCommunities(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.GetCommunities())
 }
 
 func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) *models.UserAccount {
@@ -525,7 +608,7 @@ func (s *Server) handleAdminViews(w http.ResponseWriter, r *http.Request) {
 		s.store.AppendAuditLog(models.AuditLogEntry{
 			Username: admin.Username,
 			ClientIP: s.clientIP(r),
-			Action:   "UPSERT_VIEW (" + string(view.ID) + ")",
+			Action:   "UPSERT_VIEW (" + view.Name + ")",
 		})
 		writeJSON(w, http.StatusOK, s.store.GetRouteViews())
 	case http.MethodDelete:
@@ -606,8 +689,14 @@ func (s *Server) handleAdminRRNodes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if strings.TrimSpace(node.Endpoint) == "" {
-			writeError(w, http.StatusBadRequest, "RR node endpoint (gRPC address or control socket path) cannot be empty")
+			writeError(w, http.StatusBadRequest, "RR node endpoint (gRPC address, socket path, or lg-agent URL) cannot be empty")
 			return
+		}
+		// Close old gRPC connection if an existing RR's endpoint changed
+		for _, old := range s.store.GetRRNodes() {
+			if old.ID == strings.TrimSpace(node.ID) && old.Endpoint != strings.TrimSpace(node.Endpoint) {
+				bgp.CloseGRPCConnection(old.Endpoint)
+			}
 		}
 		if err := s.store.UpsertRRNode(node); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -622,6 +711,11 @@ func (s *Server) handleAdminRRNodes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.store.GetRRNodes())
 	case http.MethodDelete:
 		id := r.URL.Query().Get("id")
+		for _, old := range s.store.GetRRNodes() {
+			if old.ID == id {
+				bgp.CloseGRPCConnection(old.Endpoint)
+			}
+		}
 		if err := s.store.DeleteRRNode(id); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -687,7 +781,14 @@ func (s *Server) handleAdminProbeRRNode(w http.ResponseWriter, r *http.Request) 
 			msg = fmt.Sprintf("GoBGP gRPC endpoint %s connection failed: %v", endpoint, err)
 		}
 	case "bird2":
-		if _, err := exec.LookPath("birdc"); err != nil {
+		if bgp.IsRemoteAgentEndpoint(endpoint) {
+			if health, err := bgp.ProbeRemoteAgent(r.Context(), endpoint, target.AgentToken); err == nil {
+				reachable = true
+				msg = fmt.Sprintf("Remote BIRD 2 lg-agent reachable (%dms): %s", time.Since(start).Milliseconds(), health.Message)
+			} else {
+				msg = fmt.Sprintf("Remote BIRD 2 lg-agent probe failed: %v", err)
+			}
+		} else if _, err := exec.LookPath("birdc"); err != nil {
 			msg = fmt.Sprintf("BIRD 2 client (birdc) not found in PATH (%v)", err)
 		} else if endpoint != "" && !strings.EqualFold(endpoint, "local") {
 			if _, errStat := os.Stat(endpoint); errStat == nil {
@@ -701,7 +802,14 @@ func (s *Server) handleAdminProbeRRNode(w http.ResponseWriter, r *http.Request) 
 			msg = "BIRD 2 client (birdc) is installed and ready"
 		}
 	case "frr":
-		if _, err := exec.LookPath("vtysh"); err != nil {
+		if bgp.IsRemoteAgentEndpoint(endpoint) {
+			if health, err := bgp.ProbeRemoteAgent(r.Context(), endpoint, target.AgentToken); err == nil {
+				reachable = true
+				msg = fmt.Sprintf("Remote FRR lg-agent reachable (%dms): %s", time.Since(start).Milliseconds(), health.Message)
+			} else {
+				msg = fmt.Sprintf("Remote FRR lg-agent probe failed: %v", err)
+			}
+		} else if _, err := exec.LookPath("vtysh"); err != nil {
 			msg = fmt.Sprintf("FRR client (vtysh) not found in PATH (%v)", err)
 		} else if endpoint != "" && !strings.EqualFold(endpoint, "local") {
 			if _, errStat := os.Stat(endpoint); errStat == nil {
@@ -719,9 +827,7 @@ func (s *Server) handleAdminProbeRRNode(w http.ResponseWriter, r *http.Request) 
 	}
 
 	latencyMs := time.Since(start).Milliseconds()
-	target.Healthy = reachable
-	target.LastChecked = time.Now().Format(time.RFC3339)
-	_ = s.store.UpsertRRNode(*target)
+	_ = s.store.UpdateRRNodeHealth(target.ID, reachable, time.Now().Format(time.RFC3339))
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id":         target.ID,
@@ -778,35 +884,37 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleAdminCommunities(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminSecurityLocks(w http.ResponseWriter, r *http.Request) {
 	admin := s.requireAdmin(w, r)
 	if admin == nil {
 		return
 	}
-
 	switch r.Method {
-	case http.MethodPost, http.MethodPut:
-		var entry models.CommunityDictEntry
-		if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-			writeError(w, http.StatusBadRequest, "Invalid community dictionary entry")
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.loginGuard.ListEntries())
+	case http.MethodDelete, http.MethodPost:
+		target := strings.TrimSpace(r.URL.Query().Get("key"))
+		if target == "" && r.Method == http.MethodPost {
+			var body struct {
+				Key string `json:"key"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			target = strings.TrimSpace(body.Key)
+		}
+		if target == "" {
+			writeError(w, http.StatusBadRequest, "key parameter is required (e.g. ip:1.2.3.4, user:admin, or all)")
 			return
 		}
-		if _, err := security.ValidateCommunity(entry.Community); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := s.store.UpsertCommunity(entry); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, s.store.GetCommunities())
-	case http.MethodDelete:
-		comm := r.URL.Query().Get("community")
-		if err := s.store.DeleteCommunity(comm); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, s.store.GetCommunities())
+		removed := s.loginGuard.Unban(target)
+		s.store.AppendAuditLog(models.AuditLogEntry{
+			Username: admin.Username,
+			ClientIP: s.clientIP(r),
+			Action:   fmt.Sprintf("UNBAN_LOGIN (%s, removed=%d)", target, removed),
+		})
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"removed": removed,
+			"locks":   s.loginGuard.ListEntries(),
+		})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 	}

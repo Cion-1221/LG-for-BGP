@@ -14,12 +14,12 @@ import (
 
 // Note: BGP routing tables (RIBs) are NOT stored in MySQL/MariaDB.
 // All BGP routes and routing tables reside strictly in each RR's in-memory RIBs.
-// MySQL/MariaDB only stores system settings, RR node endpoints, user accounts, community labels, and audit logs.
+// MySQL/MariaDB only stores system settings, PoP groups, VRF views, RR node endpoints, user accounts, and audit logs.
 const mysqlSchemaDDL = `
 CREATE TABLE IF NOT EXISTS lg_settings (
     id INT PRIMARY KEY DEFAULT 1,
     access_mode VARCHAR(32) NOT NULL DEFAULT 'public',
-    admin_secret_slug VARCHAR(128) NOT NULL DEFAULT '_console_8f92a1c4',
+    admin_secret_slug VARCHAR(128) NOT NULL DEFAULT 'console',
     public_allowed_views JSON NOT NULL,
     default_rr_node VARCHAR(64) NOT NULL DEFAULT 'auto',
     default_engine VARCHAR(32) NOT NULL DEFAULT 'gobgp',
@@ -36,9 +36,10 @@ CREATE TABLE IF NOT EXISTS lg_vrfs (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(128) NOT NULL,
     vrf_name VARCHAR(128) NOT NULL,
-    type VARCHAR(32) NOT NULL DEFAULT 'gobgp',
+    type VARCHAR(32) NOT NULL DEFAULT 'auto',
     pop VARCHAR(64) NOT NULL DEFAULT 'all',
-    juniper_source_ipv4 VARCHAR(64) NOT NULL DEFAULT '10.255.0.10',
+    rr_node_ids JSON NULL,
+    juniper_source_ipv4 VARCHAR(64) NOT NULL DEFAULT '',
     description TEXT NOT NULL,
     sort_order INT NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS lg_rr_nodes (
     engine_type VARCHAR(32) NOT NULL DEFAULT 'gobgp',
     loopback_ip VARCHAR(64) NOT NULL,
     endpoint VARCHAR(128) NOT NULL,
+    agent_token VARCHAR(255) NOT NULL DEFAULT '',
     role VARCHAR(32) NOT NULL DEFAULT 'primary',
     enabled TINYINT(1) NOT NULL DEFAULT 1,
     healthy TINYINT(1) NOT NULL DEFAULT 1,
@@ -78,13 +80,6 @@ CREATE TABLE IF NOT EXISTS lg_users (
     notes TEXT,
     created_at DATETIME NOT NULL,
     last_login_at DATETIME NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS lg_communities (
-    community VARCHAR(64) PRIMARY KEY,
-    label VARCHAR(255) NOT NULL,
-    category VARCHAR(64) NOT NULL DEFAULT 'upstream',
-    description TEXT NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS lg_audit_logs (
@@ -112,9 +107,11 @@ func (s *AppStore) initMySQL(dsn string) error {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err := db.Ping(); err != nil {
+		_ = db.Close()
 		return fmt.Errorf("failed to ping MySQL/MariaDB server: %w", err)
 	}
 	s.db = db
+	s.dbDriver = "mysql"
 
 	stmts := splitSQLStatements(mysqlSchemaDDL)
 	for _, stmt := range stmts {
@@ -125,6 +122,8 @@ func (s *AppStore) initMySQL(dsn string) error {
 	// Automatic online migration for existing databases
 	_, _ = s.db.Exec("ALTER TABLE lg_users ADD COLUMN must_change_password TINYINT(1) NOT NULL DEFAULT 0")
 	_, _ = s.db.Exec("ALTER TABLE lg_vrfs ADD COLUMN pop VARCHAR(64) NOT NULL DEFAULT 'all'")
+	_, _ = s.db.Exec("ALTER TABLE lg_vrfs ADD COLUMN rr_node_ids JSON NULL")
+	_, _ = s.db.Exec("ALTER TABLE lg_rr_nodes ADD COLUMN agent_token VARCHAR(255) NOT NULL DEFAULT ''")
 
 	var count int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM lg_settings").Scan(&count); err != nil {
@@ -182,8 +181,16 @@ func (s *AppStore) syncAllToMySQLLocked() error {
 		return nil
 	}
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
 	pubViewsJSON, _ := json.Marshal(s.data.Settings.PublicAllowedViews)
-	_, err := s.db.Exec(`
+	_, err = tx.Exec(`
 		INSERT INTO lg_settings (
 			id, access_mode, admin_secret_slug, public_allowed_views, default_rr_node,
 			default_engine, cache_ttl_seconds, rate_limit_per_minute, organization_name,
@@ -227,20 +234,25 @@ func (s *AppStore) syncAllToMySQLLocked() error {
 		}
 		vType := v.Type
 		if vType == "" {
-			vType = "gobgp"
+			vType = "auto"
 		}
 		vPop := strings.TrimSpace(v.POP)
 		if vPop == "" {
 			vPop = "all"
 		}
-		_, err := s.db.Exec(`
-			INSERT INTO lg_vrfs (id, name, vrf_name, type, pop, juniper_source_ipv4, description, sort_order)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		rrIDs := v.RRNodeIDs
+		if rrIDs == nil {
+			rrIDs = []string{}
+		}
+		rrIDsJSON, _ := json.Marshal(rrIDs)
+		_, err := tx.Exec(`
+			INSERT INTO lg_vrfs (id, name, vrf_name, type, pop, rr_node_ids, juniper_source_ipv4, description, sort_order)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
 				name=VALUES(name), vrf_name=VALUES(vrf_name), type=VALUES(type), pop=VALUES(pop),
-				juniper_source_ipv4=VALUES(juniper_source_ipv4), description=VALUES(description),
-				sort_order=VALUES(sort_order)
-		`, string(v.ID), v.Name, vrfName, vType, vPop, v.JuniperSourceIPv4, v.Description, idx)
+				rr_node_ids=VALUES(rr_node_ids), juniper_source_ipv4=VALUES(juniper_source_ipv4),
+				description=VALUES(description), sort_order=VALUES(sort_order)
+		`, string(v.ID), v.Name, vrfName, vType, vPop, string(rrIDsJSON), v.JuniperSourceIPv4, v.Description, idx)
 		if err != nil {
 			return err
 		}
@@ -251,7 +263,7 @@ func (s *AppStore) syncAllToMySQLLocked() error {
 		if order <= 0 {
 			order = idx + 1
 		}
-		_, err := s.db.Exec(`
+		_, err := tx.Exec(`
 			INSERT INTO lg_pops (id, name, description, sort_order)
 			VALUES (?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
@@ -263,16 +275,16 @@ func (s *AppStore) syncAllToMySQLLocked() error {
 	}
 
 	for _, n := range s.data.RRNodes {
-		_, err := s.db.Exec(`
+		_, err := tx.Exec(`
 			INSERT INTO lg_rr_nodes (
-				id, name, location, engine_type, loopback_ip, endpoint, role, enabled, healthy, last_checked
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				id, name, location, engine_type, loopback_ip, endpoint, agent_token, role, enabled, healthy, last_checked
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
 				name=VALUES(name), location=VALUES(location), engine_type=VALUES(engine_type),
-				loopback_ip=VALUES(loopback_ip), endpoint=VALUES(endpoint), role=VALUES(role),
-				enabled=VALUES(enabled), healthy=VALUES(healthy), last_checked=VALUES(last_checked)
+				loopback_ip=VALUES(loopback_ip), endpoint=VALUES(endpoint), agent_token=VALUES(agent_token),
+				role=VALUES(role), enabled=VALUES(enabled), healthy=VALUES(healthy), last_checked=VALUES(last_checked)
 		`,
-			n.ID, n.Name, n.Location, n.EngineType, n.LoopbackIP, n.Endpoint, n.Role, n.Enabled, n.Healthy, n.LastChecked,
+			n.ID, n.Name, n.Location, n.EngineType, n.LoopbackIP, n.Endpoint, n.AgentToken, n.Role, n.Enabled, n.Healthy, n.LastChecked,
 		)
 		if err != nil {
 			return err
@@ -281,7 +293,7 @@ func (s *AppStore) syncAllToMySQLLocked() error {
 
 	for _, u := range s.data.Users {
 		viewsJSON, _ := json.Marshal(u.AllowedViews)
-		_, err := s.db.Exec(`
+		_, err := tx.Exec(`
 			INSERT INTO lg_users (
 				id, username, password_hash, display_name, company, customer_asn,
 				role, allowed_views, rate_limit_per_minute, enabled, must_change_password, notes, created_at, last_login_at
@@ -302,19 +314,7 @@ func (s *AppStore) syncAllToMySQLLocked() error {
 		}
 	}
 
-	for _, c := range s.data.Communities {
-		_, err := s.db.Exec(`
-			INSERT INTO lg_communities (community, label, category, description)
-			VALUES (?, ?, ?, ?)
-			ON DUPLICATE KEY UPDATE
-				label=VALUES(label), category=VALUES(category), description=VALUES(description)
-		`, c.Community, c.Label, c.Category, c.Description)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return tx.Commit()
 }
 
 func (s *AppStore) loadFromMySQLLocked() error {
@@ -345,9 +345,9 @@ func (s *AppStore) loadFromMySQLLocked() error {
 	s.data.Settings.AccessMode = models.AccessMode(modeStr)
 	_ = json.Unmarshal([]byte(pubViewsRaw), &s.data.Settings.PublicAllowedViews)
 
-	// Load VRF Configurations (Name, VRFName, Type, POP)
+	// Load VRF Configurations (Name, VRFName, Type, POP, RRNodeIDs)
 	vRows, err := s.db.Query(`
-		SELECT id, name, vrf_name, type, COALESCE(pop, 'all'), juniper_source_ipv4, description
+		SELECT id, name, vrf_name, type, COALESCE(pop, 'all'), COALESCE(CAST(rr_node_ids AS CHAR), ''), juniper_source_ipv4, description
 		FROM lg_vrfs ORDER BY sort_order ASC, id ASC
 	`)
 	if err == nil {
@@ -355,18 +355,13 @@ func (s *AppStore) loadFromMySQLLocked() error {
 		var loadedViews []models.RouteViewMeta
 		for vRows.Next() {
 			var v models.RouteViewMeta
-			var idStr string
-			if err := vRows.Scan(&idStr, &v.Name, &v.VRFName, &v.Type, &v.POP, &v.JuniperSourceIPv4, &v.Description); err == nil {
+			var idStr, rrIDsRaw string
+			if err := vRows.Scan(&idStr, &v.Name, &v.VRFName, &v.Type, &v.POP, &rrIDsRaw, &v.JuniperSourceIPv4, &v.Description); err == nil {
 				v.ID = models.RouteViewID(idStr)
-				if v.POP == "" {
-					v.POP = "all"
+				if strings.TrimSpace(rrIDsRaw) != "" {
+					_ = json.Unmarshal([]byte(rrIDsRaw), &v.RRNodeIDs)
 				}
-				v.ShortName = v.VRFName
-				v.JunosContextType = "routing-instances"
-				v.JunosContextName = v.VRFName
-				v.JunosTable = v.VRFName + ".inet.0"
-				v.BirdTableV4 = v.VRFName
-				v.FrrViewName = v.VRFName
+				normalizeLoadedRouteView(&v)
 				loadedViews = append(loadedViews, v)
 			}
 		}
@@ -388,7 +383,7 @@ func (s *AppStore) loadFromMySQLLocked() error {
 
 	// Load RRNodes
 	rRows, err := s.db.Query(`
-		SELECT id, name, location, engine_type, loopback_ip, endpoint, role, enabled, healthy, last_checked
+		SELECT id, name, location, engine_type, loopback_ip, endpoint, COALESCE(agent_token, ''), role, enabled, healthy, last_checked
 		FROM lg_rr_nodes ORDER BY id ASC
 	`)
 	if err != nil {
@@ -400,13 +395,14 @@ func (s *AppStore) loadFromMySQLLocked() error {
 		var n models.RRNodeConfig
 		if err := rRows.Scan(
 			&n.ID, &n.Name, &n.Location, &n.EngineType, &n.LoopbackIP,
-			&n.Endpoint, &n.Role, &n.Enabled, &n.Healthy, &n.LastChecked,
+			&n.Endpoint, &n.AgentToken, &n.Role, &n.Enabled, &n.Healthy, &n.LastChecked,
 		); err != nil {
 			return err
 		}
 		s.data.RRNodes = append(s.data.RRNodes, n)
 	}
 	s.ensurePOPsFromRRNodesLocked()
+	migrated := s.migrateLegacyViewBindingsLocked()
 
 	// Load Users
 	uRows, err := s.db.Query(`
@@ -437,23 +433,14 @@ func (s *AppStore) loadFromMySQLLocked() error {
 		s.data.Users = append(s.data.Users, u)
 	}
 
-	// Automatically prune any deleted/stale VRF IDs from PublicAllowedViews and User AllowedViews
-	s.pruneStaleViewIDsLocked()
-	_ = s.syncAllToMySQLLocked()
-
-	// Load Communities
-	cRows, err := s.db.Query(`SELECT community, label, category, description FROM lg_communities ORDER BY community ASC`)
-	if err != nil {
-		return err
+	// Automatically prune any deleted/stale VRF IDs incrementally
+	if s.pruneStaleViewIDsLocked() {
+		_ = s.syncAllowedViewsDBLocked()
 	}
-	defer cRows.Close()
-	s.data.Communities = nil
-	for cRows.Next() {
-		var c models.CommunityDictEntry
-		if err := cRows.Scan(&c.Community, &c.Label, &c.Category, &c.Description); err != nil {
-			return err
+	if migrated {
+		for idx, v := range s.data.RouteViews {
+			_ = s.upsertRouteViewDBLocked(v, idx)
 		}
-		s.data.Communities = append(s.data.Communities, c)
 	}
 
 	// Load recent 1000 Audit Logs

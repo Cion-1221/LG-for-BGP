@@ -123,4 +123,95 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 	if len(lookupResp.Results) != 2 {
 		t.Fatalf("expected 2 view results, got %d", len(lookupResp.Results))
 	}
+
+	// 5. Verify community dictionary endpoints have been removed
+	reqComm := httptest.NewRequest(http.MethodGet, "/api/v1/communities", nil)
+	recComm := httptest.NewRecorder()
+	handler.ServeHTTP(recComm, reqComm)
+	if recComm.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for removed /api/v1/communities, got %d", recComm.Code)
+	}
+
+	reqAdminComm := httptest.NewRequest(http.MethodPost, "/api/v1/admin/communities", bytes.NewBufferString(`{}`))
+	recAdminComm := httptest.NewRecorder()
+	handler.ServeHTTP(recAdminComm, reqAdminComm)
+	if recAdminComm.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for removed /api/v1/admin/communities, got %d", recAdminComm.Code)
+	}
+
+	// 6. Verify cross-PoP view query is rejected with HTTP 400
+	_ = st.UpsertRouteView(models.RouteViewMeta{
+		ID:      "hkg_only_vrf",
+		Name:    "HKG Only",
+		VRFName: "VRF-HKG-ONLY",
+		Type:    "gobgp",
+		POP:     "HKG-POP",
+	})
+	settings = st.GetSettings()
+	settings.AccessMode = models.AccessModePublic
+	_, _ = st.UpdateSettings(settings)
+
+	reqCrossPoP := httptest.NewRequest(http.MethodPost, "/api/v1/bgp/lookup", bytes.NewBufferString(`{"query_type":"prefix","target":"8.8.8.8","views":["hkg_only_vrf"],"pop":"SIN-POP"}`))
+	recCrossPoP := httptest.NewRecorder()
+	handler.ServeHTTP(recCrossPoP, reqCrossPoP)
+	if recCrossPoP.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for cross-PoP VRF query, got %d: %s", recCrossPoP.Code, recCrossPoP.Body.String())
+	}
+
+	// 7. Verify login brute-force lockout (5 bad attempts -> 429) and Admin manual unban
+	for i := 1; i <= 5; i++ {
+		reqBad := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"tenant_alpha","password":"WrongPassword"}`))
+		reqBad.RemoteAddr = "198.51.100.22:54321"
+		recBad := httptest.NewRecorder()
+		handler.ServeHTTP(recBad, reqBad)
+		if i < 5 && recBad.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d", i, recBad.Code)
+		}
+		if i == 5 && recBad.Code != http.StatusTooManyRequests {
+			t.Fatalf("attempt 5: expected 429 lock, got %d: %s", recBad.Code, recBad.Body.String())
+		}
+	}
+
+	// Locked out even with correct password until unbanned
+	reqBlocked := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"tenant_alpha","password":"TenantA@123"}`))
+	reqBlocked.RemoteAddr = "198.51.100.22:54321"
+	recBlocked := httptest.NewRecorder()
+	handler.ServeHTTP(recBlocked, reqBlocked)
+	if recBlocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 while locked out, got %d", recBlocked.Code)
+	}
+
+	// Login as admin from a different IP to manually unban
+	reqAdminLogin := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"admin","password":"Admin@123456"}`))
+	reqAdminLogin.RemoteAddr = "203.0.113.10:12345"
+	recAdminLogin := httptest.NewRecorder()
+	handler.ServeHTTP(recAdminLogin, reqAdminLogin)
+	if recAdminLogin.Code != http.StatusOK {
+		t.Fatalf("admin login failed: %d %s", recAdminLogin.Code, recAdminLogin.Body.String())
+	}
+	var adminResp struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(recAdminLogin.Body.Bytes(), &adminResp)
+
+	// Unban all via Admin Security endpoint
+	reqUnban := httptest.NewRequest(http.MethodDelete, "/api/v1/admin/security/locks?key=all", nil)
+	reqUnban.Header.Set("Authorization", "Bearer "+adminResp.Token)
+	recUnban := httptest.NewRecorder()
+	handler.ServeHTTP(recUnban, reqUnban)
+	if recUnban.Code != http.StatusOK {
+		t.Fatalf("expected 200 on manual unban, got %d: %s", recUnban.Code, recUnban.Body.String())
+	}
+
+	// Now tenant_alpha from 198.51.100.22 can log in again immediately
+	reqUnblocked := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"tenant_alpha","password":"TenantA@123"}`))
+	reqUnblocked.RemoteAddr = "198.51.100.22:54321"
+	recUnblocked := httptest.NewRecorder()
+	handler.ServeHTTP(recUnblocked, reqUnblocked)
+	if recUnblocked.Code != http.StatusOK {
+		t.Fatalf("expected 200 after manual unban, got %d: %s", recUnblocked.Code, recUnblocked.Body.String())
+	}
+	srv.Close()
+	cache.Close()
+	_ = st.Close()
 }

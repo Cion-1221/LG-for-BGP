@@ -1,7 +1,7 @@
 import {
   AuditLogEntry,
   BGPNeighborSummary,
-  CommunityDictEntry,
+  LoginLockEntry,
   LookupResponse,
   POPGroup,
   RouteViewID,
@@ -62,7 +62,6 @@ export interface BootstrapResponse {
   all_views: RouteViewMeta[];
   pops?: POPGroup[];
   rr_nodes: RRNodeConfig[];
-  communities: CommunityDictEntry[];
 }
 
 export const api = {
@@ -154,17 +153,13 @@ export const api = {
     request<{ status: string }>(`/api/v1/admin/users?id=${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
-  saveCommunity: (entry: CommunityDictEntry) =>
-    request<CommunityDictEntry[]>('/api/v1/admin/communities', {
-      method: 'POST',
-      body: JSON.stringify(entry),
-    }),
-  deleteCommunity: (community: string) =>
-    request<CommunityDictEntry[]>(
-      `/api/v1/admin/communities?community=${encodeURIComponent(community)}`,
+  getAuditLogs: () => request<AuditLogEntry[]>('/api/v1/admin/audit-logs'),
+  getLoginLocks: () => request<LoginLockEntry[]>('/api/v1/admin/security/locks'),
+  unbanLoginLock: (key: string) =>
+    request<{ removed: number; locks: LoginLockEntry[] }>(
+      `/api/v1/admin/security/locks?key=${encodeURIComponent(key)}`,
       { method: 'DELETE' }
     ),
-  getAuditLogs: () => request<AuditLogEntry[]>('/api/v1/admin/audit-logs'),
   clearCache: () =>
     request<{ status: string }>('/api/v1/admin/cache/clear', {
       method: 'POST',

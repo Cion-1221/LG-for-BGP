@@ -3,7 +3,6 @@ import { api, BootstrapResponse, setToken } from './api';
 import {
   AuditLogEntry,
   BGPNeighborSummary,
-  CommunityDictEntry,
   LookupResponse,
   POPGroup,
   RouteViewID,
@@ -56,9 +55,9 @@ export const App: React.FC = () => {
     document.body.style.color = isDark ? '#f1f5f9' : '#0f172a';
   }, [isDark]);
 
-  const [adminSection, setAdminSection] = useState<
-    'settings' | 'views' | 'rr' | 'users' | 'communities' | 'logs'
-  >('settings');
+  const [adminSection, setAdminSection] = useState<'settings' | 'views' | 'rr' | 'users' | 'logs'>(
+    'settings'
+  );
 
   // Auth & Password Change States
   const [username, setUsername] = useState('');
@@ -101,7 +100,7 @@ export const App: React.FC = () => {
     name: '',
     vrf_name: '',
     type: 'gobgp',
-    pop: 'all',
+    pop: '',
     short_name: '',
     junos_context_type: 'routing-instances',
     junos_context_name: '',
@@ -153,13 +152,6 @@ export const App: React.FC = () => {
     enabled: true,
     must_change_password: true,
     notes: '',
-  });
-
-  const [editingComm, setEditingComm] = useState<CommunityDictEntry>({
-    community: '',
-    label: '',
-    category: 'upstream',
-    description: '',
   });
 
   // Compute all configured PoP groups (merging boot.pops and any active RR locations)
@@ -216,17 +208,18 @@ export const App: React.FC = () => {
     }
   }, [activePOPGroups, selectedPOP]);
 
-  // Filter permitted VRF views for the currently selected POP
+  // Strictly show only permitted VRF views belonging to the currently selected PoP
+  // (or explicitly marked 'all'). NEVER fall back to showing another PoP's VRFs.
   const visiblePermittedViews = useMemo(() => {
     if (!boot) return [];
     const allPermitted = boot.permitted_views || [];
-    if (!selectedPOP || activePOPGroups.length <= 1) return allPermitted;
-    const filtered = allPermitted.filter(
-      (v) =>
-        !v.pop || v.pop.toLowerCase() === 'all' || v.pop.toLowerCase() === selectedPOP.toLowerCase()
-    );
-    return filtered.length > 0 ? filtered : allPermitted;
-  }, [boot, selectedPOP, activePOPGroups]);
+    if (!selectedPOP) return allPermitted;
+    const targetPop = selectedPOP.trim().toLowerCase();
+    return allPermitted.filter((v) => {
+      const vPop = (v.pop || '').trim().toLowerCase();
+      return vPop === '' || vPop === 'all' || vPop === targetPop;
+    });
+  }, [boot, selectedPOP]);
 
   useEffect(() => {
     const visibleIDs = visiblePermittedViews.map((v) => v.id);
@@ -351,7 +344,7 @@ export const App: React.FC = () => {
         query_type: queryType,
         target: queryVal,
         views: selectedViews,
-        pop: selectedPOP || 'all',
+        pop: selectedPOP || activePOPGroups[0]?.id || 'all',
         rr_node_id: 'auto',
         engine: 'auto',
       });
@@ -399,7 +392,7 @@ export const App: React.FC = () => {
     }
   }, [portalMode, adminSection, boot?.current_user?.role]);
 
-  // Theme-adaptive surface classes
+  // Theme-adaptive surface & semantic accent classes
   const bgPage = isDark ? 'bg-[#060911] text-slate-100' : 'bg-slate-50 text-slate-900';
   const bgHeader = isDark
     ? 'bg-[#0b101d]/95 border-slate-800/80'
@@ -411,8 +404,26 @@ export const App: React.FC = () => {
   const bgInput = isDark
     ? 'bg-[#060911] border-slate-800 text-white placeholder:text-slate-500'
     : 'bg-white border-slate-300 text-slate-900 placeholder:text-slate-400';
+  const borderSubtle = isDark ? 'border-slate-800/70' : 'border-slate-200';
+  const divideSubtle = isDark ? 'divide-slate-800/50' : 'divide-slate-200';
   const textPrimary = isDark ? 'text-white' : 'text-slate-900';
-  const textSecondary = isDark ? 'text-slate-400' : 'text-slate-500';
+  const textSecondary = isDark ? 'text-slate-400' : 'text-slate-600';
+  const textSky = isDark ? 'text-sky-400' : 'text-sky-700';
+  const textEmerald = isDark ? 'text-emerald-400' : 'text-emerald-700';
+  const textAmber = isDark ? 'text-amber-400' : 'text-amber-700';
+  const textRose = isDark ? 'text-rose-400' : 'text-rose-700';
+  const badgeSky = isDark
+    ? 'bg-sky-500/15 text-sky-400 border-sky-500/30'
+    : 'bg-sky-50 text-sky-700 border-sky-200';
+  const badgeEmerald = isDark
+    ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+    : 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  const badgeAmber = isDark
+    ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+    : 'bg-amber-50 text-amber-700 border-amber-200';
+  const badgeRose = isDark
+    ? 'bg-rose-500/15 text-rose-400 border-rose-500/30'
+    : 'bg-rose-50 text-rose-700 border-rose-200';
   const layoutContainer = 'w-full max-w-[96vw] 2xl:max-w-[95vw] mx-auto px-3 sm:px-5';
 
   const renderThemeSwitcher = () => (
@@ -498,7 +509,7 @@ export const App: React.FC = () => {
         </p>
 
         {pwdError && (
-          <div className="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs">
+          <div className="mb-4 p-3 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 dark:bg-rose-500/10 dark:border-rose-500/30 dark:text-rose-400 text-xs">
             {pwdError}
           </div>
         )}
@@ -623,7 +634,7 @@ export const App: React.FC = () => {
             </div>
 
             {loginError && (
-              <div className="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs">
+              <div className="mb-4 p-3 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 dark:bg-rose-500/10 dark:border-rose-500/30 dark:text-rose-400 text-xs">
                 {loginError}
               </div>
             )}
@@ -685,7 +696,7 @@ export const App: React.FC = () => {
                   <span className={`font-bold text-base tracking-tight ${textPrimary}`}>
                     BGP Looking Glass Administration
                   </span>
-                  <span className="text-[11px] px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-500 border border-amber-500/30 font-mono font-semibold">
+                  <span className={`text-[11px] px-2 py-0.5 rounded-md border font-mono font-semibold ${badgeAmber}`}>
                     CONTROL PLANE
                   </span>
                 </div>
@@ -699,7 +710,7 @@ export const App: React.FC = () => {
               {renderThemeSwitcher()}
               <button
                 onClick={() => switchPortal('lg')}
-                className="px-3.5 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-500 border border-sky-500/30 font-medium transition"
+                className={`px-3.5 py-1.5 rounded-lg border font-medium transition hover:opacity-85 ${badgeSky}`}
               >
                 ↗ Public Looking Glass
               </button>
@@ -715,7 +726,7 @@ export const App: React.FC = () => {
               <span className={`font-mono ${textSecondary}`}>{boot.current_user?.username}</span>
               <button
                 onClick={handleLogout}
-                className="px-2.5 py-1.5 rounded-lg text-rose-500 hover:bg-rose-500/10 font-medium transition"
+                className={`px-2.5 py-1.5 rounded-lg hover:bg-rose-500/10 font-medium transition ${textRose}`}
               >
                 Sign Out
               </button>
@@ -747,12 +758,7 @@ export const App: React.FC = () => {
                   label: '4. User Accounts & RBAC',
                   badge: String(users.length),
                 },
-                {
-                  id: 'communities',
-                  label: '5. Community Dictionary',
-                  badge: String(boot.communities.length),
-                },
-                { id: 'logs', label: '6. Audit Logs & Cache', badge: '' },
+                { id: 'logs', label: '5. Audit Logs & Cache', badge: '' },
               ] as const
             ).map((item) => (
               <button
@@ -774,8 +780,8 @@ export const App: React.FC = () => {
                       adminSection === item.id
                         ? 'bg-slate-950/20 text-slate-950 font-bold'
                         : isDark
-                          ? 'bg-slate-800 text-slate-400'
-                          : 'bg-slate-100 text-slate-600'
+                          ? 'bg-slate-800 text-slate-300'
+                          : 'bg-slate-100 text-slate-700'
                     }`}
                   >
                     {item.badge}
@@ -787,7 +793,7 @@ export const App: React.FC = () => {
 
           <section className="lg:col-span-9 xl:col-span-10 space-y-5">
             {adminMsg && (
-              <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-500 text-xs flex justify-between items-center font-medium">
+              <div className={`p-3.5 rounded-xl border text-xs flex justify-between items-center font-medium ${badgeEmerald}`}>
                 <span>{adminMsg}</span>
                 <button
                   onClick={() => setAdminMsg('')}
@@ -825,7 +831,7 @@ export const App: React.FC = () => {
                           : `${bgSubCard} opacity-75 hover:opacity-100`
                       }`}
                     >
-                      <div className="font-bold text-sm text-emerald-500 mb-1">
+                      <div className="font-bold text-sm text-emerald-700 dark:text-emerald-400 mb-1">
                         Public Direct Query Mode
                       </div>
                       <p className={`text-xs ${textSecondary} leading-relaxed`}>
@@ -849,7 +855,7 @@ export const App: React.FC = () => {
                           : `${bgSubCard} opacity-75 hover:opacity-100`
                       }`}
                     >
-                      <div className="font-bold text-sm text-amber-500 mb-1">
+                      <div className="font-bold text-sm text-amber-700 dark:text-amber-400 mb-1">
                         Authenticated Account Mode
                       </div>
                       <p className={`text-xs ${textSecondary} leading-relaxed`}>
@@ -866,7 +872,7 @@ export const App: React.FC = () => {
                     setAdminMsg('Global settings saved.');
                     await loadBootstrap();
                   }}
-                  className="space-y-4 pt-5 border-t border-slate-800/40 text-xs"
+                  className="space-y-4 pt-5 border-t border-slate-200 dark:border-slate-800/70 text-xs"
                 >
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div>
@@ -1006,7 +1012,7 @@ export const App: React.FC = () => {
                                 }}
                               />
                               <span className={`font-semibold ${textPrimary}`}>{v.name}</span>
-                              <span className="text-sky-500 font-mono text-[11px] ml-auto">
+                              <span className="text-sky-700 dark:text-sky-400 font-mono text-[11px] ml-auto">
                                 {v.vrf_name} ({v.pop && v.pop !== 'all' ? v.pop : 'ALL PoPs'})
                               </span>
                             </label>
@@ -1035,7 +1041,7 @@ export const App: React.FC = () => {
                   </h2>
                   <p className={textSecondary}>
                     Configure Frontend Display Name (<b>Name</b>), Underlying RIB / VRF Name (
-                    <b>VRF Name</b> — leave blank or enter <code className="text-sky-500">global</code>{' '}
+                    <b>VRF Name</b> — leave blank or enter <code className="text-sky-700 dark:text-sky-400">global</code>{' '}
                     for a single global table), Query Engine (<b>Type</b>), and <b>PoP Group Scope</b>.
                   </p>
                 </div>
@@ -1054,14 +1060,14 @@ export const App: React.FC = () => {
                         <div className="space-y-1">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className={`font-bold text-sm ${textPrimary}`}>{v.name}</span>
-                            <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-500 border border-emerald-500/30 font-mono uppercase font-semibold">
+                            <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 font-mono uppercase font-semibold">
                               {v.type === 'gobgp' ? 'GOBGP (gRPC)' : v.type}
                             </span>
-                            <span className="text-[10px] px-2 py-0.5 rounded bg-sky-500/15 text-sky-500 border border-sky-500/30 font-mono">
+                            <span className="text-[10px] px-2 py-0.5 rounded bg-sky-500/15 text-sky-700 dark:text-sky-400 border border-sky-500/30 font-mono">
                               PoP: {v.pop && v.pop !== 'all' ? v.pop : 'ALL PoPs'}
                             </span>
                           </div>
-                          <div className="font-mono text-sky-500">
+                          <div className="font-mono text-sky-700 dark:text-sky-400">
                             VRF Name: <span className={textPrimary}>{v.vrf_name}</span> · ID: {v.id}
                           </div>
                           {v.juniper_source_ipv4 && (
@@ -1081,7 +1087,7 @@ export const App: React.FC = () => {
                                 pop: v.pop || 'all',
                               })
                             }
-                            className="px-2.5 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-500 font-medium"
+                            className="px-2.5 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-400 font-medium"
                           >
                             Edit
                           </button>
@@ -1113,7 +1119,8 @@ export const App: React.FC = () => {
                     e.preventDefault();
                     try {
                       const vrfVal = editingView.vrf_name.trim() || 'global';
-                      const popVal = (editingView.pop || '').trim() || 'all';
+                      const popVal =
+                        (editingView.pop || '').trim() || configuredPOPGroups[0]?.id || 'all';
                       const payload: RouteViewMeta = {
                         ...editingView,
                         vrf_name: vrfVal,
@@ -1133,7 +1140,7 @@ export const App: React.FC = () => {
                         name: '',
                         vrf_name: '',
                         type: 'gobgp',
-                        pop: 'all',
+                        pop: configuredPOPGroups[0]?.id || 'all',
                         short_name: '',
                         junos_context_type: 'routing-instances',
                         junos_context_name: '',
@@ -1152,7 +1159,7 @@ export const App: React.FC = () => {
                       setAdminMsg(err instanceof Error ? err.message : 'Save failed');
                     }
                   }}
-                  className="pt-5 border-t border-slate-800/40 space-y-4"
+                  className={`pt-5 border-t ${borderSubtle} space-y-4`}
                 >
                   <h3 className={`text-sm font-bold ${textPrimary}`}>
                     Add or Update VRF / Routing Table
@@ -1173,7 +1180,7 @@ export const App: React.FC = () => {
                     </div>
                     <div>
                       <label className={`block font-medium mb-1 ${textSecondary}`}>
-                        2. VRF Name <span className="text-sky-500">[Blank/global = Global]</span>
+                        2. VRF Name <span className={textSky}>[Blank/global = Global]</span>
                       </label>
                       <input
                         type="text"
@@ -1206,19 +1213,19 @@ export const App: React.FC = () => {
                     </div>
                     <div>
                       <label className={`block font-medium mb-1 ${textSecondary}`}>
-                        4. PoP Group Scope
+                        4. PoP Group Scope *
                       </label>
                       <select
-                        value={editingView.pop || 'all'}
+                        value={editingView.pop || configuredPOPGroups[0]?.id || 'all'}
                         onChange={(e) => setEditingView({ ...editingView, pop: e.target.value })}
                         className={`w-full px-3 py-2 rounded-lg border font-mono ${bgInput}`}
                       >
-                        <option value="all">all (Available in All PoPs)</option>
                         {configuredPOPGroups.map((p) => (
                           <option key={p.id} value={p.id}>
                             {p.name} ({p.id})
                           </option>
                         ))}
+                        <option value="all">all (Shared Across All PoPs)</option>
                       </select>
                     </div>
                     <div>
@@ -1285,9 +1292,9 @@ export const App: React.FC = () => {
                     </h2>
                     <p className={textSecondary}>
                       Define your Points of Presence (PoPs) as groups here first (e.g.,{' '}
-                      <code className="text-sky-500">HKG-POP-01</code>,{' '}
-                      <code className="text-sky-500">TYO-POP-01</code>,{' '}
-                      <code className="text-sky-500">SGP-POP-01</code>). When adding Route Reflector
+                      <code className="text-sky-700 dark:text-sky-400">HKG-POP-01</code>,{' '}
+                      <code className="text-sky-700 dark:text-sky-400">TYO-POP-01</code>,{' '}
+                      <code className="text-sky-700 dark:text-sky-400">SGP-POP-01</code>). When adding Route Reflector
                       (RR) nodes below, select the corresponding PoP group from the dropdown. If 2
                       or more PoPs are active, the Public Looking Glass automatically displays PoP
                       tabs above the query type bar.
@@ -1308,7 +1315,7 @@ export const App: React.FC = () => {
                           <div>
                             <div className="flex items-center justify-between gap-2">
                               <span className={`font-bold text-sm ${textPrimary}`}>{pop.name}</span>
-                              <span className="text-[10px] px-2 py-0.5 rounded bg-sky-500/15 text-sky-500 border border-sky-500/30 font-mono font-semibold">
+                              <span className="text-[10px] px-2 py-0.5 rounded bg-sky-500/15 text-sky-700 dark:text-sky-400 border border-sky-500/30 font-mono font-semibold">
                                 {pop.id}
                               </span>
                             </div>
@@ -1316,11 +1323,11 @@ export const App: React.FC = () => {
                               <div className={`mt-1 ${textSecondary}`}>{pop.description}</div>
                             )}
                           </div>
-                          <div className="flex items-center gap-2 pt-2 border-t border-slate-800/30">
+                          <div className="flex items-center gap-2 pt-2 border-t border-slate-200 dark:border-slate-800/60">
                             <button
                               type="button"
                               onClick={() => setEditingPOP(pop)}
-                              className="text-sky-500 hover:underline font-medium"
+                              className="text-sky-700 dark:text-sky-400 hover:underline font-medium"
                             >
                               Edit
                             </button>
@@ -1359,7 +1366,7 @@ export const App: React.FC = () => {
                         setAdminMsg(err instanceof Error ? err.message : 'Save PoP failed');
                       }
                     }}
-                    className="grid grid-cols-1 md:grid-cols-4 gap-3.5 pt-4 border-t border-slate-800/40 items-end"
+                    className="grid grid-cols-1 md:grid-cols-4 gap-3.5 pt-4 border-t border-slate-200 dark:border-slate-800/70 items-end"
                   >
                     <div>
                       <label className={`block font-medium mb-1 ${textSecondary}`}>
@@ -1419,8 +1426,8 @@ export const App: React.FC = () => {
                       </h2>
                       <p className={textSecondary}>
                         Assign each RR node to a defined PoP Group and configure 1 or multiple RRs (
-                        <code className="text-sky-500">primary</code> +{' '}
-                        <code className="text-amber-500">backup</code>) per PoP.
+                        <code className="text-sky-700 dark:text-sky-400">primary</code> +{' '}
+                        <code className="text-amber-700 dark:text-amber-400">backup</code>) per PoP.
                       </p>
                     </div>
                     <button
@@ -1449,16 +1456,16 @@ export const App: React.FC = () => {
                   </div>
 
                   {boot.rr_nodes.length === 0 ? (
-                    <div className={`p-6 rounded-xl border text-center text-amber-500 ${bgSubCard}`}>
+                    <div className={`p-6 rounded-xl border text-center text-amber-700 dark:text-amber-400 ${bgSubCard}`}>
                       No Route Reflector (RR) node configured yet. Add at least 1 RR node below to enable BGP route queries.
                     </div>
                   ) : (
                     <div className="space-y-4">
                       {Array.from(rrsByPOP.entries()).map(([popCode, popNodes]) => (
                         <div key={popCode} className={`p-4 rounded-xl border ${bgSubCard} space-y-3`}>
-                          <div className="flex items-center justify-between border-b border-slate-800/40 pb-2">
+                          <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800/70 pb-2">
                             <div className="flex items-center gap-2">
-                              <span className="px-2.5 py-0.5 rounded-md bg-sky-500/15 text-sky-500 border border-sky-500/30 font-mono font-bold">
+                              <span className="px-2.5 py-0.5 rounded-md bg-sky-500/15 text-sky-700 dark:text-sky-400 border border-sky-500/30 font-mono font-bold">
                                 PoP: {popNameByID.get(popCode.toUpperCase()) || popCode} ({popCode})
                               </span>
                               <span className={textSecondary}>
@@ -1482,8 +1489,8 @@ export const App: React.FC = () => {
                                       <span
                                         className={`text-[10px] px-2 py-0.5 rounded font-mono uppercase ${
                                           n.role === 'primary'
-                                            ? 'bg-sky-500/20 text-sky-500 border border-sky-500/30'
-                                            : 'bg-amber-500/20 text-amber-500 border border-amber-500/30'
+                                            ? 'bg-sky-500/20 text-sky-700 dark:text-sky-400 border border-sky-500/30'
+                                            : 'bg-amber-500/20 text-amber-700 dark:text-amber-400 border border-amber-500/30'
                                         }`}
                                       >
                                         {n.role}
@@ -1493,30 +1500,30 @@ export const App: React.FC = () => {
                                       <span
                                         className={`text-[10px] px-2 py-0.5 rounded font-mono ${
                                           n.enabled
-                                            ? 'bg-emerald-500/20 text-emerald-500'
+                                            ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-400'
                                             : 'bg-rose-500/20 text-rose-500'
                                         }`}
                                       >
                                         {n.enabled ? 'ENABLED' : 'DISABLED'}
                                       </span>
-                                      <span className="text-[10px] px-2 py-0.5 rounded bg-slate-500/15 text-slate-400 font-mono uppercase">
+                                      <span className="text-[10px] px-2 py-0.5 rounded bg-slate-200/80 text-slate-700 dark:bg-slate-800 dark:text-slate-300 font-mono uppercase">
                                         {n.engine_type === 'gobgp' ? 'GOBGP (gRPC)' : n.engine_type}
                                       </span>
                                     </div>
                                   </div>
-                                  <div className="font-mono text-sky-500 mt-2">
-                                    Endpoint: <span className="text-emerald-500">{n.endpoint}</span> ·
+                                  <div className="font-mono text-sky-700 dark:text-sky-400 mt-2">
+                                    Endpoint: <span className="text-emerald-700 dark:text-emerald-400">{n.endpoint}</span> ·
                                     Loopback: {n.loopback_ip}
                                   </div>
                                   <div className={`font-mono mt-0.5 text-[11px] ${textSecondary}`}>
                                     ID: {n.id} · PoP: {n.location} · Status:{' '}
-                                    <span className={n.healthy ? 'text-emerald-500' : 'text-amber-500'}>
+                                    <span className={n.healthy ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400'}>
                                       {n.healthy ? 'Reachable' : 'Unverified'}
                                     </span>
                                   </div>
                                 </div>
 
-                                <div className="flex flex-wrap items-center gap-2 pt-2.5 border-t border-slate-800/40">
+                                <div className="flex flex-wrap items-center gap-2 pt-2.5 border-t border-slate-200 dark:border-slate-800/70">
                                   <button
                                     type="button"
                                     onClick={async () => {
@@ -1533,14 +1540,14 @@ export const App: React.FC = () => {
                                         );
                                       }
                                     }}
-                                    className="px-2.5 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-500 border border-emerald-500/30 font-medium"
+                                    className="px-2.5 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 font-medium"
                                   >
                                     Test Connection
                                   </button>
                                   <button
                                     type="button"
                                     onClick={() => setEditingRR(n)}
-                                    className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-500 font-medium"
+                                    className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-400 font-medium"
                                   >
                                     Edit
                                   </button>
@@ -1559,7 +1566,7 @@ export const App: React.FC = () => {
                                         );
                                       }
                                     }}
-                                    className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-500 font-medium"
+                                    className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-700 dark:text-amber-400 font-medium"
                                   >
                                     {n.enabled ? 'Disable' : 'Enable'}
                                   </button>
@@ -1608,7 +1615,7 @@ export const App: React.FC = () => {
                         setAdminMsg(err instanceof Error ? err.message : 'Save failed');
                       }
                     }}
-                    className="pt-5 border-t border-slate-800/40 space-y-3.5"
+                    className="pt-5 border-t border-slate-200 dark:border-slate-800/70 space-y-3.5"
                   >
                     <h3 className={`text-sm font-bold ${textPrimary}`}>
                       Add or Update Route Reflector (RR) Node
@@ -1798,14 +1805,14 @@ export const App: React.FC = () => {
                     <button
                       type="button"
                       onClick={loadAdminData}
-                      className="px-3 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-500 font-medium"
+                      className="px-3 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-400 font-medium"
                     >
                       Refresh Peers
                     </button>
                   </div>
                   <table className="w-full text-left text-xs">
                     <thead>
-                      <tr className={`border-b border-slate-800/40 ${textSecondary}`}>
+                      <tr className={`border-b border-slate-200 dark:border-slate-800/70 ${textSecondary}`}>
                         <th className="py-2.5 px-3">Route View</th>
                         <th className="py-2.5 px-3">VRF / Instance</th>
                         <th className="py-2.5 px-3">Neighbor IP</th>
@@ -1815,7 +1822,7 @@ export const App: React.FC = () => {
                         <th className="py-2.5 px-3">Uptime</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-800/30 font-mono">
+                    <tbody className="divide-y divide-slate-200 dark:divide-slate-800/60 font-mono">
                       {neighbors.length === 0 ? (
                         <tr>
                           <td colSpan={7} className={`py-4 text-center font-sans ${textSecondary}`}>
@@ -1828,13 +1835,13 @@ export const App: React.FC = () => {
                             <td className={`py-2.5 px-3 font-sans font-semibold ${textPrimary}`}>
                               {n.view_name}
                             </td>
-                            <td className="py-2.5 px-3 text-sky-500">{n.junos_context}</td>
-                            <td className="py-2.5 px-3 text-amber-500">{n.neighbor_ip || '-'}</td>
+                            <td className="py-2.5 px-3 text-sky-700 dark:text-sky-400">{n.junos_context}</td>
+                            <td className="py-2.5 px-3 text-amber-700 dark:text-amber-400">{n.neighbor_ip || '-'}</td>
                             <td className="py-2.5 px-3">
                               <span
                                 className={`px-2 py-0.5 rounded text-[11px] ${
                                   n.session_state === 'Established'
-                                    ? 'bg-emerald-500/20 text-emerald-500'
+                                    ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-400'
                                     : 'bg-rose-500/20 text-rose-500'
                                 }`}
                               >
@@ -1883,7 +1890,7 @@ export const App: React.FC = () => {
                             notes: '',
                           })
                         }
-                        className="text-sky-500 hover:underline text-[11px] font-medium"
+                        className="text-sky-700 dark:text-sky-400 hover:underline text-[11px] font-medium"
                       >
                         + New Account
                       </button>
@@ -1978,7 +1985,7 @@ export const App: React.FC = () => {
                     </div>
 
                     <div className="pt-1">
-                      <label className="flex items-center gap-2.5 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-500 cursor-pointer font-medium">
+                      <label className="flex items-center gap-2.5 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-700 dark:text-amber-400 cursor-pointer font-medium">
                         <input
                           type="checkbox"
                           checked={editingUser.must_change_password}
@@ -2023,7 +2030,7 @@ export const App: React.FC = () => {
                                   }}
                                 />
                                 <span className={`font-semibold ${textPrimary}`}>{v.name}</span>
-                                <span className="text-sky-500 font-mono text-[11px] ml-auto">
+                                <span className="text-sky-700 dark:text-sky-400 font-mono text-[11px] ml-auto">
                                   {v.vrf_name}
                                 </span>
                               </label>
@@ -2048,14 +2055,14 @@ export const App: React.FC = () => {
                   </h3>
                   <table className="w-full text-left">
                     <thead>
-                      <tr className={`border-b border-slate-800/40 ${textSecondary}`}>
+                      <tr className={`border-b border-slate-200 dark:border-slate-800/70 ${textSecondary}`}>
                         <th className="py-2.5 px-2">Username / Organization</th>
                         <th className="py-2.5 px-2">Role</th>
                         <th className="py-2.5 px-2">Authorized VRF Views</th>
                         <th className="py-2.5 px-2">Actions</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-800/30">
+                    <tbody className="divide-y divide-slate-200 dark:divide-slate-800/60">
                       {users.map((u) => {
                         const activeViews =
                           u.role === 'admin'
@@ -2069,14 +2076,14 @@ export const App: React.FC = () => {
                               <div className="flex items-center gap-2">
                                 <span className={`font-bold ${textPrimary}`}>{u.username}</span>
                                 {u.must_change_password && (
-                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-500 border border-amber-500/30 font-mono">
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/30 font-mono">
                                     Pwd Reset Required
                                   </span>
                                 )}
                               </div>
                               <div className={textSecondary}>{u.display_name}</div>
                             </td>
-                            <td className="py-3 px-2 font-mono uppercase text-sky-500 font-semibold">
+                            <td className="py-3 px-2 font-mono uppercase text-sky-700 dark:text-sky-400 font-semibold">
                               {u.role}
                             </td>
                             <td className="py-3 px-2">
@@ -2087,7 +2094,7 @@ export const App: React.FC = () => {
                                   {activeViews.map((v) => (
                                     <span
                                       key={v.id}
-                                      className="px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-500 border border-emerald-500/30 font-mono text-[11px]"
+                                      className="px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 font-mono text-[11px]"
                                       title={`ID: ${v.id}`}
                                     >
                                       {v.vrf_name} ({v.name})
@@ -2114,7 +2121,7 @@ export const App: React.FC = () => {
                                     notes: u.notes || '',
                                   })
                                 }
-                                className="text-sky-500 hover:underline font-medium"
+                                className="text-sky-700 dark:text-sky-400 hover:underline font-medium"
                               >
                                 Edit
                               </button>
@@ -2139,104 +2146,7 @@ export const App: React.FC = () => {
               </div>
             )}
 
-            {/* SECTION 5: COMMUNITY DICTIONARY CRUD (ADMIN ONLY) */}
-            {adminSection === 'communities' && (
-              <div className={`${bgCard} border rounded-2xl p-6 space-y-5 text-xs`}>
-                <div>
-                  <h2 className={`text-base font-bold ${textPrimary} mb-1`}>
-                    BGP Community Translation Dictionary
-                  </h2>
-                  <p className={textSecondary}>
-                    Maintain internal or carrier BGP community labels for administrative reference.
-                  </p>
-                </div>
-                <form
-                  onSubmit={async (e) => {
-                    e.preventDefault();
-                    try {
-                      await api.saveCommunity(editingComm);
-                      setAdminMsg(`Saved Community ${editingComm.community}`);
-                      setEditingComm({
-                        community: '',
-                        label: '',
-                        category: 'upstream',
-                        description: '',
-                      });
-                      await loadBootstrap();
-                    } catch (err: unknown) {
-                      setAdminMsg(err instanceof Error ? err.message : 'Save failed');
-                    }
-                  }}
-                  className="grid grid-cols-1 md:grid-cols-4 gap-3.5"
-                >
-                  <input
-                    type="text"
-                    required
-                    value={editingComm.community}
-                    onChange={(e) => setEditingComm({ ...editingComm, community: e.target.value })}
-                    placeholder="Community (e.g. 65000:1001)"
-                    className={`px-3.5 py-2 rounded-lg border font-mono ${bgInput}`}
-                  />
-                  <input
-                    type="text"
-                    required
-                    value={editingComm.label}
-                    onChange={(e) => setEditingComm({ ...editingComm, label: e.target.value })}
-                    placeholder="Label"
-                    className={`px-3.5 py-2 rounded-lg border ${bgInput}`}
-                  />
-                  <input
-                    type="text"
-                    value={editingComm.description}
-                    onChange={(e) =>
-                      setEditingComm({ ...editingComm, description: e.target.value })
-                    }
-                    placeholder="Description"
-                    className={`px-3.5 py-2 rounded-lg border ${bgInput}`}
-                  />
-                  <button
-                    type="submit"
-                    className="py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold transition"
-                  >
-                    Save Community
-                  </button>
-                </form>
-
-                {boot.communities.length === 0 ? (
-                  <div className={`p-6 rounded-xl border text-center ${bgSubCard} ${textSecondary}`}>
-                    No BGP community entries configured.
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-4 border-t border-slate-800/40">
-                    {boot.communities.map((c) => (
-                      <div
-                        key={c.community}
-                        className={`p-3.5 rounded-xl border flex justify-between items-center ${bgSubCard}`}
-                      >
-                        <div>
-                          <span className="font-mono font-bold text-sky-500">{c.community}</span> —{' '}
-                          <span className={`font-semibold ${textPrimary}`}>{c.label}</span>
-                          {c.description && (
-                            <div className={`${textSecondary} mt-0.5`}>{c.description}</div>
-                          )}
-                        </div>
-                        <button
-                          onClick={async () => {
-                            await api.deleteCommunity(c.community);
-                            await loadBootstrap();
-                          }}
-                          className="text-rose-500 hover:underline shrink-0 ml-2 font-medium"
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* SECTION 6: AUDIT LOGS & CACHE (WITH PAGINATION & PAGE SIZE) */}
+            {/* SECTION 5: AUDIT LOGS & CACHE (WITH PAGINATION & PAGE SIZE) */}
             {adminSection === 'logs' && (() => {
               const totalLogs = auditLogs.length;
               const totalPages = Math.max(1, Math.ceil(totalLogs / auditPageSize));
@@ -2279,7 +2189,7 @@ export const App: React.FC = () => {
                       <button
                         type="button"
                         onClick={loadAdminData}
-                        className="px-3 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-500 border border-sky-500/30 font-semibold transition"
+                        className="px-3 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-400 border border-sky-500/30 font-semibold transition"
                       >
                         Refresh Logs
                       </button>
@@ -2291,7 +2201,7 @@ export const App: React.FC = () => {
                           setAdminMsg('Flushed all cached BGP query results.');
                           await loadAdminData();
                         }}
-                        className="px-3.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-500 border border-amber-500/30 font-semibold transition"
+                        className="px-3.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-700 dark:text-amber-400 border border-amber-500/30 font-semibold transition"
                       >
                         Flush Route Cache
                       </button>
@@ -2301,7 +2211,7 @@ export const App: React.FC = () => {
                   <div className="overflow-x-auto">
                     <table className="w-full text-left font-mono">
                       <thead>
-                        <tr className={`border-b border-slate-800/40 ${textSecondary}`}>
+                        <tr className={`border-b border-slate-200 dark:border-slate-800/70 ${textSecondary}`}>
                           <th className="py-2.5 px-2">Time</th>
                           <th className="py-2.5 px-2">User</th>
                           <th className="py-2.5 px-2">Client IP</th>
@@ -2309,7 +2219,7 @@ export const App: React.FC = () => {
                           <th className="py-2.5 px-2">Query Target / Views</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-800/30">
+                      <tbody className="divide-y divide-slate-200 dark:divide-slate-800/60">
                         {pagedLogs.length === 0 ? (
                           <tr>
                             <td colSpan={5} className={`py-6 text-center font-sans ${textSecondary}`}>
@@ -2323,8 +2233,8 @@ export const App: React.FC = () => {
                                 {new Date(log.timestamp).toLocaleString()}
                               </td>
                               <td className={`py-2.5 px-2 ${textPrimary}`}>{log.username}</td>
-                              <td className="py-2.5 px-2 text-sky-500">{log.client_ip}</td>
-                              <td className="py-2.5 px-2 text-emerald-500">{log.action}</td>
+                              <td className="py-2.5 px-2 text-sky-700 dark:text-sky-400">{log.client_ip}</td>
+                              <td className="py-2.5 px-2 text-emerald-700 dark:text-emerald-400">{log.action}</td>
                               <td className={`py-2.5 px-2 ${textSecondary}`}>
                                 {log.target
                                   ? `${log.query_type}: ${log.target} [${log.views}]`
@@ -2339,7 +2249,7 @@ export const App: React.FC = () => {
 
                   {/* Pagination Footer */}
                   {totalLogs > 0 && (
-                    <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-800/40">
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-200 dark:border-slate-800/70">
                       <div className={`font-mono ${textSecondary}`}>
                         Page <span className={`font-bold ${textPrimary}`}>{currentPage}</span> of{' '}
                         <span className={`font-bold ${textPrimary}`}>{totalPages}</span> ({totalLogs}{' '}
@@ -2425,7 +2335,7 @@ export const App: React.FC = () => {
                 <span className={`font-bold text-base tracking-tight ${textPrimary}`}>
                   {boot.settings.organization_name}
                 </span>
-                <span className="text-[11px] px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-500 border border-sky-500/30 font-mono font-semibold">
+                <span className={`text-[11px] px-2 py-0.5 rounded-md border font-mono font-semibold ${badgeSky}`}>
                   AS{boot.settings.primary_asn}
                 </span>
                 <span
@@ -2461,13 +2371,13 @@ export const App: React.FC = () => {
                     setPwdError('');
                     setShowChangePwdModal(true);
                   }}
-                  className="text-sky-500 hover:underline ml-1 font-medium"
+                  className={`${textSky} hover:underline ml-1 font-medium`}
                 >
                   Password
                 </button>
                 <button
                   onClick={handleLogout}
-                  className="text-rose-500 hover:underline ml-1 font-medium"
+                  className={`${textRose} hover:underline ml-1 font-medium`}
                 >
                   Sign Out
                 </button>
@@ -2487,7 +2397,7 @@ export const App: React.FC = () => {
               Please sign in with your authorized account to query BGP routing tables.
             </p>
             {loginError && (
-              <div className="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs">
+              <div className={`mb-4 p-3 rounded-lg border text-xs ${badgeRose}`}>
                 {loginError}
               </div>
             )}
@@ -2530,8 +2440,10 @@ export const App: React.FC = () => {
             <div className={`${bgCard} border rounded-2xl p-5 sm:p-6 space-y-4`}>
               {/* ROW 1 (OPTIONAL): MULTI-POP SEGMENTED TABS — ONLY SHOWN WHEN 2 OR MORE POPS ARE CONFIGURED */}
               {activePOPGroups.length > 1 && (
-                <div className="flex flex-wrap items-center gap-2 pb-3 border-b border-slate-800/40">
-                  <span className={`text-xs font-semibold mr-1 ${textSecondary}`}>PoP Node:</span>
+                <div className={`flex flex-wrap items-center gap-3 pb-3.5 border-b ${borderSubtle}`}>
+                  <span className={`text-sm font-bold min-w-[88px] shrink-0 ${textPrimary}`}>
+                    PoP Node:
+                  </span>
                   <div
                     className={`inline-flex flex-wrap p-1 rounded-xl border gap-1 ${
                       isDark ? 'bg-[#060911] border-slate-800/90' : 'bg-slate-100 border-slate-200'
@@ -2546,28 +2458,30 @@ export const App: React.FC = () => {
                           onClick={() => {
                             if (selectedPOP.toLowerCase() !== pop.id.toLowerCase()) {
                               setSelectedPOP(pop.id);
+                              setQueryType('prefix');
+                              setSelectedViews([]);
                               setTarget('');
                               setLookupResult(null);
                               setLookupError('');
                             }
                           }}
-                          className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition flex items-center gap-1.5 ${
+                          className={`px-4 py-2 rounded-lg text-sm font-bold transition flex items-center gap-2 ${
                             active
                               ? 'bg-indigo-600 text-white shadow-sm'
                               : isDark
-                                ? 'text-slate-400 hover:text-slate-200'
-                                : 'text-slate-600 hover:text-slate-900'
+                                ? 'text-slate-300 hover:text-white'
+                                : 'text-slate-700 hover:text-slate-950'
                           }`}
                         >
                           <span>{pop.name}</span>
                           {pop.name !== pop.id && (
                             <span
-                              className={`text-[10px] font-mono px-1.5 py-0.2 rounded ${
+                              className={`text-[11px] font-mono px-1.5 py-0.5 rounded font-medium ${
                                 active
                                   ? 'bg-white/20 text-white'
                                   : isDark
-                                    ? 'bg-slate-800 text-slate-400'
-                                    : 'bg-slate-200 text-slate-600'
+                                    ? 'bg-slate-800 text-slate-300'
+                                    : 'bg-slate-200/90 text-slate-700'
                               }`}
                             >
                               {pop.id}
@@ -2582,40 +2496,45 @@ export const App: React.FC = () => {
 
               {/* ROW 2: QUERY TYPE SEGMENTED TABS */}
               <div className="flex flex-wrap items-center justify-between gap-4">
-                <div
-                  className={`inline-flex flex-wrap p-1 rounded-xl border gap-1 ${
-                    isDark ? 'bg-[#060911] border-slate-800/90' : 'bg-slate-100 border-slate-200'
-                  }`}
-                >
-                  {(
-                    [
-                      { id: 'prefix', label: 'IPv4 / IPv6 Prefix' },
-                      { id: 'aspath', label: 'ASN / AS-Path' },
-                      { id: 'community', label: 'BGP Community' },
-                    ] as const
-                  ).map((qt) => (
-                    <button
-                      key={qt.id}
-                      type="button"
-                      onClick={() => {
-                        if (queryType !== qt.id) {
-                          setQueryType(qt.id);
-                          setTarget('');
-                          setLookupResult(null);
-                          setLookupError('');
-                        }
-                      }}
-                      className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition ${
-                        queryType === qt.id
-                          ? 'bg-sky-600 text-white shadow-sm'
-                          : isDark
-                            ? 'text-slate-400 hover:text-slate-200'
-                            : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      {qt.label}
-                    </button>
-                  ))}
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className={`text-xs font-semibold min-w-[88px] shrink-0 ${textSecondary}`}>
+                    Query Type:
+                  </span>
+                  <div
+                    className={`inline-flex flex-wrap p-1 rounded-xl border gap-1 ${
+                      isDark ? 'bg-[#060911] border-slate-800/90' : 'bg-slate-100 border-slate-200'
+                    }`}
+                  >
+                    {(
+                      [
+                        { id: 'prefix', label: 'IPv4 / IPv6 Prefix' },
+                        { id: 'aspath', label: 'ASN / AS-Path' },
+                        { id: 'community', label: 'BGP Community' },
+                      ] as const
+                    ).map((qt) => (
+                      <button
+                        key={qt.id}
+                        type="button"
+                        onClick={() => {
+                          if (queryType !== qt.id) {
+                            setQueryType(qt.id);
+                            setTarget('');
+                            setLookupResult(null);
+                            setLookupError('');
+                          }
+                        }}
+                        className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${
+                          queryType === qt.id
+                            ? 'bg-sky-600 text-white shadow-sm'
+                            : isDark
+                              ? 'text-slate-400 hover:text-slate-200'
+                              : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {qt.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
                 {visiblePermittedViews.length > 1 && (
@@ -2623,7 +2542,7 @@ export const App: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => setSelectedViews(visiblePermittedViews.map((v) => v.id))}
-                      className="text-sky-500 hover:underline font-medium"
+                      className={`${textSky} hover:underline font-medium`}
                     >
                       Select All ({visiblePermittedViews.length})
                     </button>
@@ -2646,7 +2565,9 @@ export const App: React.FC = () => {
                 </div>
                 {visiblePermittedViews.length === 0 ? (
                   <div className={`p-4 rounded-xl border text-xs ${bgSubCard} ${textSecondary}`}>
-                    No routing tables are currently assigned or configured.
+                    {activePOPDisplay
+                      ? `No routing tables / VRFs are currently configured for PoP ${activePOPDisplay}.`
+                      : 'No routing tables are currently assigned or configured.'}
                   </div>
                 ) : (
                   <div className="flex flex-wrap gap-2.5">
@@ -2668,8 +2589,10 @@ export const App: React.FC = () => {
                           <span
                             className={`w-3.5 h-3.5 rounded flex items-center justify-center border text-[10px] ${
                               checked
-                                ? 'bg-sky-500 border-sky-400 text-white font-bold'
-                                : 'border-slate-500/50 bg-transparent'
+                                ? 'bg-sky-600 border-sky-500 text-white font-bold'
+                                : isDark
+                                  ? 'border-slate-500/60 bg-transparent'
+                                  : 'border-slate-400 bg-white'
                             }`}
                           >
                             {checked ? '✓' : ''}
@@ -2677,9 +2600,13 @@ export const App: React.FC = () => {
                           <span className="font-semibold">{view.name}</span>
                           <span
                             className={`text-[10px] font-mono px-1.5 py-0.5 rounded uppercase ${
-                              isDark
-                                ? 'bg-slate-800/90 text-slate-300'
-                                : 'bg-slate-200/80 text-slate-700'
+                              checked
+                                ? isDark
+                                  ? 'bg-sky-950/80 text-sky-200 border border-sky-500/30'
+                                  : 'bg-sky-100 text-sky-900 border border-sky-200'
+                                : isDark
+                                  ? 'bg-slate-800/90 text-slate-300'
+                                  : 'bg-slate-200/80 text-slate-700'
                             }`}
                           >
                             {view.vrf_name}
@@ -2721,7 +2648,7 @@ export const App: React.FC = () => {
               </form>
 
               {lookupError && (
-                <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-500 text-xs font-mono">
+                <div className={`p-3.5 rounded-xl border text-xs font-mono ${badgeRose}`}>
                   {lookupError}
                 </div>
               )}
@@ -2733,7 +2660,7 @@ export const App: React.FC = () => {
                 {lookupResult.results.map((viewRes: ViewQueryResult) => (
                   <div
                     key={viewRes.view.id}
-                    className={`border rounded-2xl overflow-hidden shadow-xl ${
+                    className={`cli-terminal border rounded-2xl overflow-hidden shadow-xl ${
                       isDark ? 'bg-[#070a12] border-slate-800/90' : 'bg-slate-900 border-slate-300'
                     }`}
                   >
@@ -2772,7 +2699,460 @@ export const App: React.FC = () => {
                       </button>
                     </div>
 
-                    <pre className="p-5 text-xs font-mono text-emerald-300 bg-[#050811] whitespace-pre-wrap break-words leading-6 selection:bg-sky-500/30">
+                    <pre className="cli-terminal p-5 text-xs font-mono text-emerald-300 bg-[#050811] whitespace-pre-wrap break-words leading-6 selection:bg-sky-500/40 selection:text-white">
+                      {viewRes.raw_output}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+    </div>
+  );
+};
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 }
+                          className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
+                        >
+                          « First
+                        </button>
+                        <button
+                          type="button"
+                          disabled={currentPage <= 1}
+                          onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
+                          className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
+                        >
+                          ‹ Prev
+                        </button>
+                        <button
+                          type="button"
+                          disabled={currentPage >= totalPages}
+                          onClick={() => setAuditPage((p) => Math.min(totalPages, p + 1))}
+                          className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
+                        >
+                          Next ›
+                        </button>
+                        <button
+                          type="button"
+                          disabled={currentPage >= totalPages}
+                          onClick={() => setAuditPage(totalPages)}
+                          className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
+                        >
+                          Last »
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  </div>
+                </div>
+              );
+            })()}
+          </section>
+        </div>
+      </div>
+    );
+  }
+
+  // ============================================================================
+  // PORTAL 1: PUBLIC / CUSTOMER BGP LOOKING GLASS PORTAL (/)
+  // - Ultra-Wide Fluid Container (`max-w-[96vw]`) with Slim Margins
+  // - Light / Dark / System Auto Theme Switcher (`☀ Light` | `🌙 Dark` | `💻 Auto`)
+  // - PoP Segmented Tabs ABOVE Query Type Tabs (Hidden automatically if <= 1 PoP)
+  // - ZERO Admin Console / Login Buttons in Public Mode (Admin only via /<admin_path>)
+  // ============================================================================
+  const isAuthRequiredMode = boot.settings.access_mode === 'auth_required';
+  const requiresCustomerLoginGate = isAuthRequiredMode && !boot.current_user;
+  const activePOPObj =
+    activePOPGroups.find((p) => p.id.toLowerCase() === selectedPOP.toLowerCase()) ||
+    activePOPGroups[0];
+  const activePOPDisplay = activePOPObj
+    ? activePOPObj.name !== activePOPObj.id
+      ? `${activePOPObj.name} (${activePOPObj.id})`
+      : activePOPObj.id
+    : boot.settings.datacenter_code;
+
+  return (
+    <div className={`min-h-screen ${bgPage} flex flex-col font-sans transition-colors duration-150`}>
+      {mustChangePasswordGate &&
+        renderPasswordChangeModal(!!boot.current_user?.must_change_password)}
+
+      <header className={`border-b ${bgHeader} backdrop-blur sticky top-0 z-30`}>
+        <div className={`${layoutContainer} py-3.5 flex flex-wrap items-center justify-between gap-4`}>
+          <div className="flex items-center gap-3.5">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center font-bold text-sm text-white shadow-lg shadow-sky-500/20">
+              BGP
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className={`font-bold text-base tracking-tight ${textPrimary}`}>
+                  {boot.settings.organization_name}
+                </span>
+                <span className={`text-[11px] px-2 py-0.5 rounded-md border font-mono font-semibold ${badgeSky}`}>
+                  AS{boot.settings.primary_asn}
+                </span>
+                <span
+                  className={`text-[11px] px-2 py-0.5 rounded-md border font-mono ${
+                    isDark
+                      ? 'bg-slate-800/90 text-slate-300 border-slate-700/80'
+                      : 'bg-slate-100 text-slate-700 border-slate-300'
+                  }`}
+                >
+                  {activePOPDisplay}
+                </span>
+              </div>
+              <p className={`text-xs ${textSecondary} mt-0.5`}>
+                Carrier-Grade Real-Time BGP Routing Table Looking Glass
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 text-xs">
+            {renderThemeSwitcher()}
+
+            {/* Only display account controls when the portal is in auth_required mode */}
+            {isAuthRequiredMode && boot.current_user && (
+              <div
+                className={`flex items-center gap-2.5 border rounded-xl px-3.5 py-1.5 ${bgSubCard}`}
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                <span className={`font-semibold ${textPrimary}`}>
+                  {boot.current_user.display_name || boot.current_user.username}
+                </span>
+                <button
+                  onClick={() => {
+                    setPwdError('');
+                    setShowChangePwdModal(true);
+                  }}
+                  className={`${textSky} hover:underline ml-1 font-medium`}
+                >
+                  Password
+                </button>
+                <button
+                  onClick={handleLogout}
+                  className={`${textRose} hover:underline ml-1 font-medium`}
+                >
+                  Sign Out
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className={`${layoutContainer} py-6 flex-1`}>
+        {requiresCustomerLoginGate ? (
+          <div className={`max-w-md mx-auto mt-12 ${bgCard} border rounded-2xl p-7`}>
+            <h2 className={`text-base font-bold ${textPrimary} mb-1`}>
+              Sign In Required — {boot.settings.organization_name}
+            </h2>
+            <p className={`text-xs ${textSecondary} mb-5`}>
+              Please sign in with your authorized account to query BGP routing tables.
+            </p>
+            {loginError && (
+              <div className={`mb-4 p-3 rounded-lg border text-xs ${badgeRose}`}>
+                {loginError}
+              </div>
+            )}
+            <form onSubmit={(e) => handleLogin(e)} className="space-y-4">
+              <div>
+                <label className={`block text-xs font-medium ${textSecondary} mb-1.5`}>
+                  Username
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  className={`w-full px-3.5 py-2.5 rounded-lg border text-sm ${bgInput} focus:outline-none focus:border-sky-500`}
+                />
+              </div>
+              <div>
+                <label className={`block text-xs font-medium ${textSecondary} mb-1.5`}>
+                  Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className={`w-full px-3.5 py-2.5 rounded-lg border text-sm ${bgInput} focus:outline-none focus:border-sky-500`}
+                />
+              </div>
+              <button
+                type="submit"
+                className="w-full py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-sm transition shadow-lg shadow-sky-600/20"
+              >
+                Sign In
+              </button>
+            </form>
+          </div>
+        ) : (
+          <div className="space-y-5">
+            {/* UNIFIED QUERY COMMAND PANEL */}
+            <div className={`${bgCard} border rounded-2xl p-5 sm:p-6 space-y-4`}>
+              {/* ROW 1 (OPTIONAL): MULTI-POP SEGMENTED TABS — ONLY SHOWN WHEN 2 OR MORE POPS ARE CONFIGURED */}
+              {activePOPGroups.length > 1 && (
+                <div className={`flex flex-wrap items-center gap-3 pb-3.5 border-b ${borderSubtle}`}>
+                  <span className={`text-sm font-bold min-w-[88px] shrink-0 ${textPrimary}`}>
+                    PoP Node:
+                  </span>
+                  <div
+                    className={`inline-flex flex-wrap p-1 rounded-xl border gap-1 ${
+                      isDark ? 'bg-[#060911] border-slate-800/90' : 'bg-slate-100 border-slate-200'
+                    }`}
+                  >
+                    {activePOPGroups.map((pop) => {
+                      const active = selectedPOP.toLowerCase() === pop.id.toLowerCase();
+                      return (
+                        <button
+                          key={pop.id}
+                          type="button"
+                          onClick={() => {
+                            if (selectedPOP.toLowerCase() !== pop.id.toLowerCase()) {
+                              setSelectedPOP(pop.id);
+                              setQueryType('prefix');
+                              setSelectedViews([]);
+                              setTarget('');
+                              setLookupResult(null);
+                              setLookupError('');
+                            }
+                          }}
+                          className={`px-4 py-2 rounded-lg text-sm font-bold transition flex items-center gap-2 ${
+                            active
+                              ? 'bg-indigo-600 text-white shadow-sm'
+                              : isDark
+                                ? 'text-slate-300 hover:text-white'
+                                : 'text-slate-700 hover:text-slate-950'
+                          }`}
+                        >
+                          <span>{pop.name}</span>
+                          {pop.name !== pop.id && (
+                            <span
+                              className={`text-[11px] font-mono px-1.5 py-0.5 rounded font-medium ${
+                                active
+                                  ? 'bg-white/20 text-white'
+                                  : isDark
+                                    ? 'bg-slate-800 text-slate-300'
+                                    : 'bg-slate-200/90 text-slate-700'
+                              }`}
+                            >
+                              {pop.id}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* ROW 2: QUERY TYPE SEGMENTED TABS */}
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className={`text-xs font-semibold min-w-[88px] shrink-0 ${textSecondary}`}>
+                    Query Type:
+                  </span>
+                  <div
+                    className={`inline-flex flex-wrap p-1 rounded-xl border gap-1 ${
+                      isDark ? 'bg-[#060911] border-slate-800/90' : 'bg-slate-100 border-slate-200'
+                    }`}
+                  >
+                    {(
+                      [
+                        { id: 'prefix', label: 'IPv4 / IPv6 Prefix' },
+                        { id: 'aspath', label: 'ASN / AS-Path' },
+                        { id: 'community', label: 'BGP Community' },
+                      ] as const
+                    ).map((qt) => (
+                      <button
+                        key={qt.id}
+                        type="button"
+                        onClick={() => {
+                          if (queryType !== qt.id) {
+                            setQueryType(qt.id);
+                            setTarget('');
+                            setLookupResult(null);
+                            setLookupError('');
+                          }
+                        }}
+                        className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${
+                          queryType === qt.id
+                            ? 'bg-sky-600 text-white shadow-sm'
+                            : isDark
+                              ? 'text-slate-400 hover:text-slate-200'
+                              : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {qt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {visiblePermittedViews.length > 1 && (
+                  <div className="flex items-center gap-3 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedViews(visiblePermittedViews.map((v) => v.id))}
+                      className={`${textSky} hover:underline font-medium`}
+                    >
+                      Select All ({visiblePermittedViews.length})
+                    </button>
+                    <span className={textSecondary}>|</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedViews([])}
+                      className={`${textSecondary} hover:underline`}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* ROUTING INSTANCE / VRF PILLS */}
+              <div>
+                <div className={`text-xs font-medium ${textSecondary} mb-2`}>
+                  Routing Instances / VRF Tables:
+                </div>
+                {visiblePermittedViews.length === 0 ? (
+                  <div className={`p-4 rounded-xl border text-xs ${bgSubCard} ${textSecondary}`}>
+                    {activePOPDisplay
+                      ? `No routing tables / VRFs are currently configured for PoP ${activePOPDisplay}.`
+                      : 'No routing tables are currently assigned or configured.'}
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-2.5">
+                    {visiblePermittedViews.map((view) => {
+                      const checked = selectedViews.includes(view.id);
+                      return (
+                        <button
+                          key={view.id}
+                          type="button"
+                          onClick={() => toggleViewSelection(view.id)}
+                          className={`group flex items-center gap-2.5 px-3.5 py-2 rounded-xl border text-xs transition ${
+                            checked
+                              ? isDark
+                                ? 'bg-sky-500/15 border-sky-500/60 text-white shadow-sm'
+                                : 'bg-sky-50 border-sky-500 text-sky-950 shadow-sm'
+                              : `${bgSubCard} ${textSecondary} hover:opacity-90`
+                          }`}
+                        >
+                          <span
+                            className={`w-3.5 h-3.5 rounded flex items-center justify-center border text-[10px] ${
+                              checked
+                                ? 'bg-sky-600 border-sky-500 text-white font-bold'
+                                : isDark
+                                  ? 'border-slate-500/60 bg-transparent'
+                                  : 'border-slate-400 bg-white'
+                            }`}
+                          >
+                            {checked ? '✓' : ''}
+                          </span>
+                          <span className="font-semibold">{view.name}</span>
+                          <span
+                            className={`text-[10px] font-mono px-1.5 py-0.5 rounded uppercase ${
+                              checked
+                                ? isDark
+                                  ? 'bg-sky-950/80 text-sky-200 border border-sky-500/30'
+                                  : 'bg-sky-100 text-sky-900 border border-sky-200'
+                                : isDark
+                                  ? 'bg-slate-800/90 text-slate-300'
+                                  : 'bg-slate-200/80 text-slate-700'
+                            }`}
+                          >
+                            {view.vrf_name}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* SEARCH BAR */}
+              <form
+                onSubmit={(e) => handleRunLookup(e)}
+                className="flex flex-col sm:flex-row gap-3"
+              >
+                <div className="relative flex-1">
+                  <input
+                    type="text"
+                    value={target}
+                    onChange={(e) => setTarget(e.target.value)}
+                    placeholder={
+                      queryType === 'prefix'
+                        ? 'Enter IPv4/IPv6 address or CIDR prefix (e.g. 202.96.134.133 or 202.96.128.0/18)'
+                        : queryType === 'aspath'
+                          ? 'Enter ASN or AS-Path sequence (e.g. 4134 or 23764 4134)'
+                          : 'Enter BGP Community or Extended Community (e.g. 23764:11100 or 58453:33960)'
+                    }
+                    className={`w-full px-4 py-3 rounded-xl border text-sm font-mono ${bgInput} focus:outline-none focus:border-sky-500 transition`}
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={lookupLoading || visiblePermittedViews.length === 0}
+                  className="px-7 py-3 rounded-xl bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 disabled:opacity-40 text-white font-semibold text-sm transition shadow-lg shadow-sky-500/20 shrink-0"
+                >
+                  {lookupLoading ? 'Querying RIB...' : 'Query Routes'}
+                </button>
+              </form>
+
+              {lookupError && (
+                <div className={`p-3.5 rounded-xl border text-xs font-mono ${badgeRose}`}>
+                  {lookupError}
+                </div>
+              )}
+            </div>
+
+            {/* TERMINAL CLI OUTPUT WINDOWS (PURE CLI OUTPUT ONLY) */}
+            {lookupResult && (
+              <div className="space-y-5">
+                {lookupResult.results.map((viewRes: ViewQueryResult) => (
+                  <div
+                    key={viewRes.view.id}
+                    className={`cli-terminal border rounded-2xl overflow-hidden shadow-xl ${
+                      isDark ? 'bg-[#070a12] border-slate-800/90' : 'bg-slate-900 border-slate-300'
+                    }`}
+                  >
+                    <div
+                      className={`px-5 py-3 border-b flex flex-wrap items-center justify-between gap-3 ${
+                        isDark
+                          ? 'bg-[#0c1220] border-slate-800/90'
+                          : 'bg-slate-800 border-slate-700'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <div className="flex items-center gap-1.5 mr-1">
+                          <span className="w-2.5 h-2.5 rounded-full bg-rose-500/80" />
+                          <span className="w-2.5 h-2.5 rounded-full bg-amber-500/80" />
+                          <span className="w-2.5 h-2.5 rounded-full bg-emerald-500/80" />
+                        </div>
+                        <span className="font-bold text-sm text-white">{viewRes.view.name}</span>
+                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/30 font-mono">
+                          {viewRes.view.vrf_name}
+                        </span>
+                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-mono">
+                          Matched: {viewRes.matched_prefix}
+                        </span>
+                        <span className="text-xs text-slate-300 font-mono">
+                          {viewRes.total_paths} {viewRes.total_paths === 1 ? 'Path' : 'Paths'} ·{' '}
+                          {viewRes.query_time_ms}ms
+                        </span>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => copyCLIOutput(viewRes.view.id, viewRes.raw_output)}
+                        className="px-3 py-1 rounded-lg bg-slate-950/80 hover:bg-slate-950 text-xs font-mono text-slate-200 border border-slate-700 transition"
+                      >
+                        {copiedViewID === viewRes.view.id ? '✓ Copied' : 'Copy Output'}
+                      </button>
+                    </div>
+
+                    <pre className="cli-terminal p-5 text-xs font-mono text-emerald-300 bg-[#050811] whitespace-pre-wrap break-words leading-6 selection:bg-sky-500/40 selection:text-white">
                       {viewRes.raw_output}
                     </pre>
                   </div>

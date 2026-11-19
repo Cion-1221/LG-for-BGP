@@ -1,51 +1,24 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>BGP Looking Glass</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-    />
-    <script src="https://cdn.tailwindcss.com"></script>
     <script>
-      tailwind.config = {
-        darkMode: 'class',
-        theme: {
-          extend: {
-            fontFamily: {
-              sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
-              mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
-            },
-          },
-        },
-      };
+      (function () {
+        try {
+          var saved = localStorage.getItem('lg_theme_mode');
+          var prefersDark =
+            window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var isDark = saved === 'dark' || (saved !== 'light' && prefersDark);
+          document.documentElement.classList.toggle('dark', isDark);
+        } catch (e) {
+          document.documentElement.classList.add('dark');
+        }
+      })();
     </script>
-    <style>
-      body {
-        background-color: #060911;
-        color: #f1f5f9;
-      }
-      ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-      }
-      ::-webkit-scrollbar-track {
-        background: #090d16;
-      }
-      ::-webkit-scrollbar-thumb {
-        background: #1e293b;
-        border-radius: 4px;
-      }
-      ::-webkit-scrollbar-thumb:hover {
-        background: #334155;
-      }
-    </style>
   </head>
-  <body class="bg-[#060911] text-slate-100 antialiased selection:bg-sky-500/30 selection:text-sky-200">
+  <body class="bg-slate-50 text-slate-900 dark:bg-[#060911] dark:text-slate-100 antialiased selection:bg-sky-200 selection:text-slate-900 dark:selection:bg-sky-500/35 dark:selection:text-sky-100">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

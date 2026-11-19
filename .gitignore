@@ -2,6 +2,9 @@
 Server/lg-server
 Server/lg-server.exe
 Server/lg-server-*
+Server/lg-agent
+Server/lg-agent.exe
+Server/lg-agent-*
 *.exe
 *.out
 

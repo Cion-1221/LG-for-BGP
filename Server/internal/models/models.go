@@ -13,15 +13,18 @@ const (
 )
 
 // RouteViewMeta describes a VRF / RIB configuration entry managed in the Web Admin Console.
-// Note: Only this VRF metadata (Name, VRFName, Type) is stored in configuration;
-// all actual BGP routes reside strictly in the RR's in-memory VRF RIB.
+// A VRF can be bound to 1 RR node, multiple RR nodes, or all RR nodes (RRNodeIDs = ["all"]).
+// Each RR node belongs strictly to 1 PoP (RRNodeConfig.Location).
+// Note: Only this VRF metadata is stored in configuration;
+// all actual BGP routes reside strictly in each RR's in-memory VRF RIB.
 type RouteViewMeta struct {
 	ID                RouteViewID `json:"id"`
-	Name              string      `json:"name"`       // Display Name shown on the Frontend UI
-	VRFName           string      `json:"vrf_name"`   // Underlying VRF / RIB table name on the RR (e.g. "VRF-DIA")
-	Type              string      `json:"type"`       // Engine type for this VRF: "gobgp" (gRPC), "bird2", or "frr"
-	POP               string      `json:"pop"`        // POP / Location scope ("all" or specific POP code e.g. "HKG-POP-01")
-	ShortName         string      `json:"short_name"` // Short badge label (defaults to VRFName)
+	Name              string      `json:"name"`                  // Display Name shown on the Frontend UI
+	VRFName           string      `json:"vrf_name"`              // Underlying VRF / RIB table name on the RR (e.g. "VRF-DIA")
+	Type              string      `json:"type"`                  // Optional engine hint: "auto", "gobgp", "bird2", or "frr" (RR's own engine_type takes precedence)
+	POP               string      `json:"pop"`                   // Legacy PoP scope kept for backward migration; RRNodeIDs is the primary binding
+	RRNodeIDs         []string    `json:"rr_node_ids"`           // Bound RR node IDs: ["all"] for all RRs, or specific RR IDs (e.g. ["rr-01", "rr-02"])
+	ShortName         string      `json:"short_name"`            // Short badge label (defaults to VRFName)
 	JunosContextType  string      `json:"junos_context_type"`
 	JunosContextName  string      `json:"junos_context_name"`
 	JunosTable        string      `json:"junos_table"`
@@ -34,7 +37,7 @@ type RouteViewMeta struct {
 	BadgeColor        string      `json:"badge_color"`
 }
 
-// POPGroup represents a Point of Presence (PoP) group that RR nodes and VRF views can be assigned to.
+// POPGroup represents a Point of Presence (PoP) group that RR nodes are assigned to.
 type POPGroup struct {
 	ID          string `json:"id"`          // Unique PoP code/slug (e.g. "HKG-POP-01", "TYO-POP-01")
 	Name        string `json:"name"`        // Display name shown on PoP tabs (e.g. "Hong Kong POP", "Tokyo POP")
@@ -43,14 +46,16 @@ type POPGroup struct {
 }
 
 // RRNodeConfig represents a Route Reflector / Collector node (e.g., RR-01, RR-02).
+// Every RR node belongs strictly to ONE PoP (Location).
 type RRNodeConfig struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
-	Location    string `json:"location"`
-	EngineType  string `json:"engine_type"` // "gobgp", "bird2", "frr"
+	Location    string `json:"location"`              // Bound PoP Group ID (strictly 1 PoP per RR)
+	EngineType  string `json:"engine_type"`           // "gobgp", "bird2", "frr"
 	LoopbackIP  string `json:"loopback_ip"`
-	Endpoint    string `json:"endpoint"`    // e.g., "127.0.0.1:50051" for GoBGP gRPC
-	Role        string `json:"role"`        // "primary" or "secondary"
+	Endpoint    string `json:"endpoint"`              // GoBGP host:port, local socket path, or remote lg-agent URL (http(s)://host:port)
+	AgentToken  string `json:"agent_token,omitempty"` // Optional Bearer token for remote lg-agent (stripped from public bootstrap)
+	Role        string `json:"role"`                  // "primary" or "backup"
 	Enabled     bool   `json:"enabled"`
 	Healthy     bool   `json:"healthy"`
 	LastChecked string `json:"last_checked"`
@@ -129,10 +134,15 @@ type LookupResponse struct {
 	Results    []ViewQueryResult `json:"results"`
 }
 
-// BGPNeighborSummary represents the BGP session state between RR and a router instance.
+// BGPNeighborSummary represents the BGP session state between an RR and a router instance for a specific VRF.
 type BGPNeighborSummary struct {
+	POP              string      `json:"pop"`
+	RRNodeID         string      `json:"rr_node_id"`
+	RRNodeName       string      `json:"rr_node_name"`
+	EngineType       string      `json:"engine_type"`
 	ViewID           RouteViewID `json:"view_id"`
 	ViewName         string      `json:"view_name"`
+	VRFName          string      `json:"vrf_name"`
 	JunosContext     string      `json:"junos_context"`
 	NeighborIP       string      `json:"neighbor_ip"`
 	PeerASN          uint32      `json:"peer_asn"`
@@ -143,6 +153,19 @@ type BGPNeighborSummary struct {
 	PrefixesIPv4     int         `json:"prefixes_ipv4"`
 	PrefixesIPv6     int         `json:"prefixes_ipv6"`
 	UpdatesReceived  int64       `json:"updates_received"`
+}
+
+// LoginLockEntry describes a brute-force tracked or locked client IP / username for Admin Console management.
+type LoginLockEntry struct {
+	Key              string     `json:"key"`               // e.g. "ip:203.0.113.10" or "user:admin"
+	Type             string     `json:"type"`              // "ip" or "username"
+	Value            string     `json:"value"`             // Raw IP or username
+	Failures         int        `json:"failures"`
+	MaxFailures      int        `json:"max_failures"`
+	Locked           bool       `json:"locked"`
+	RemainingSeconds int        `json:"remaining_seconds"`
+	LastAttempt      time.Time  `json:"last_attempt"`
+	LockedUntil      *time.Time `json:"locked_until,omitempty"`
 }
 
 // AccessMode controls whether the Looking Glass requires login or is open to the public.
@@ -185,14 +208,6 @@ type UserAccount struct {
 	Notes              string        `json:"notes,omitempty"`
 	CreatedAt          time.Time     `json:"created_at"`
 	LastLoginAt        *time.Time    `json:"last_login_at,omitempty"`
-}
-
-// CommunityDictEntry stores a mapping from BGP Community string to human-readable description.
-type CommunityDictEntry struct {
-	Community   string `json:"community"`
-	Label       string `json:"label"`
-	Category    string `json:"category"`
-	Description string `json:"description"`
 }
 
 // AuditLogEntry records queries and administrative changes.

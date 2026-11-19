@@ -35,6 +35,34 @@ func (p *grpcConnPool) setConn(endpoint string, conn *grpc.ClientConn) {
 	p.conns[endpoint] = conn
 }
 
+func (p *grpcConnPool) closeEndpoint(endpoint string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if conn, ok := p.conns[endpoint]; ok {
+		_ = conn.Close()
+		delete(p.conns, endpoint)
+	}
+}
+
+func (p *grpcConnPool) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k, conn := range p.conns {
+		_ = conn.Close()
+		delete(p.conns, k)
+	}
+}
+
+// CloseGRPCConnection closes and removes a cached gRPC connection when an RR node is updated or deleted.
+func CloseGRPCConnection(endpoint string) {
+	defaultPool.closeEndpoint(strings.TrimSpace(endpoint))
+}
+
+// CloseAllGRPCConnections closes all pooled gRPC client connections during graceful shutdown.
+func CloseAllGRPCConnections() {
+	defaultPool.closeAll()
+}
+
 func (p *grpcConnPool) getClient(endpoint string) (apipb.GobgpApiClient, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -924,14 +952,16 @@ func (e *Engine) decodeGoBGPPath(
 	}, rawLine
 }
 
-// queryLiveGoBGPNeighbors queries GoBGP's ListPeer gRPC API to return real-time neighbor state, uptime, and prefix counts.
+// queryLiveGoBGPNeighbors queries GoBGP's ListPeer gRPC API to return real-time neighbor state, uptime, and prefix counts
+// strictly matched per VRF on this specific RR node. Never borrows another VRF's peer!
+// Returns (summaries, rrReachable).
 func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNodeConfig, views []models.RouteViewMeta) ([]models.BGPNeighborSummary, bool) {
 	client, err := defaultPool.getClient(rrNode.Endpoint)
 	if err != nil {
 		return nil, false
 	}
 
-	cctx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	stream, err := client.ListPeer(cctx, &apipb.ListPeerRequest{})
@@ -953,97 +983,132 @@ func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNo
 		}
 	}
 
-	if len(peers) == 0 {
-		return nil, false
-	}
-
 	summaries := make([]models.BGPNeighborSummary, 0, len(views))
 	for _, v := range views {
 		vrfName := resolveVRFName(v)
-		var matchedPeer *apipb.Peer
+		wantGlobal := isGlobalRIB(vrfName)
+		hintIP := strings.TrimSpace(v.JuniperSourceIPv4)
+
+		var matchedPeers []*apipb.Peer
 		for _, p := range peers {
 			confVrf := strings.TrimSpace(p.GetConf().GetVrf())
 			peerAddr := strings.TrimSpace(p.GetState().GetNeighborAddress())
 			if peerAddr == "" {
 				peerAddr = strings.TrimSpace(p.GetConf().GetNeighborAddress())
 			}
-			if (!isGlobalRIB(vrfName) && strings.EqualFold(confVrf, vrfName)) ||
-				(v.JuniperSourceIPv4 != "" && peerAddr == v.JuniperSourceIPv4) {
-				matchedPeer = p
-				break
+
+			if wantGlobal {
+				if confVrf != "" {
+					continue
+				}
+				if hintIP != "" && peerAddr != hintIP {
+					continue
+				}
+				matchedPeers = append(matchedPeers, p)
+			} else {
+				if confVrf != "" {
+					if strings.EqualFold(confVrf, vrfName) {
+						matchedPeers = append(matchedPeers, p)
+					}
+					continue
+				}
+				if hintIP != "" && peerAddr == hintIP {
+					matchedPeers = append(matchedPeers, p)
+				}
 			}
 		}
-		if matchedPeer == nil && len(peers) == 1 {
-			matchedPeer = peers[0]
-		}
-		if matchedPeer == nil {
+
+		if len(matchedPeers) == 0 {
+			summaries = append(summaries, models.BGPNeighborSummary{
+				POP:              rrNode.Location,
+				RRNodeID:         rrNode.ID,
+				RRNodeName:       rrNode.Name,
+				EngineType:       "gobgp",
+				ViewID:           v.ID,
+				ViewName:         v.Name,
+				VRFName:          v.VRFName,
+				JunosContext:     fmt.Sprintf("%s %s", v.JunosContextType, v.VRFName),
+				NeighborIP:       hintIP,
+				PeerASN:          0,
+				SessionState:     "No Peer / Idle",
+				Uptime:           "-",
+				AddPathRx:        false,
+				NextHopUnchanged: true,
+				PrefixesIPv4:     0,
+				PrefixesIPv6:     0,
+				UpdatesReceived:  0,
+			})
 			continue
 		}
 
-		peerAddr := matchedPeer.GetState().GetNeighborAddress()
-		if peerAddr == "" {
-			peerAddr = matchedPeer.GetConf().GetNeighborAddress()
-		}
-		peerASN := matchedPeer.GetState().GetPeerAsn()
-		if peerASN == 0 {
-			peerASN = matchedPeer.GetConf().GetPeerAsn()
-		}
-
-		stateStr := "Idle"
-		switch matchedPeer.GetState().GetSessionState() {
-		case apipb.PeerState_ESTABLISHED:
-			stateStr = "Established"
-		case apipb.PeerState_ACTIVE:
-			stateStr = "Active"
-		case apipb.PeerState_CONNECT:
-			stateStr = "Connect"
-		case apipb.PeerState_OPENSENT:
-			stateStr = "OpenSent"
-		case apipb.PeerState_OPENCONFIRM:
-			stateStr = "OpenConfirm"
-		}
-
-		uptimeStr := "00:00:00"
-		if matchedPeer.GetTimers().GetState().GetUptime() != nil {
-			uptimeStr = formatGoBGPTimedelta(matchedPeer.GetTimers().GetState().GetUptime().AsTime())
-		}
-
-		var rxV4, rxV6, totalRx uint64
-		for _, afisafi := range matchedPeer.GetAfiSafis() {
-			st := afisafi.GetState()
-			if st == nil {
-				continue
+		for _, matchedPeer := range matchedPeers {
+			peerAddr := strings.TrimSpace(matchedPeer.GetState().GetNeighborAddress())
+			if peerAddr == "" {
+				peerAddr = strings.TrimSpace(matchedPeer.GetConf().GetNeighborAddress())
 			}
-			acc := st.GetAccepted()
-			if acc == 0 {
-				acc = st.GetReceived()
+			peerASN := matchedPeer.GetState().GetPeerAsn()
+			if peerASN == 0 {
+				peerASN = matchedPeer.GetConf().GetPeerAsn()
 			}
-			totalRx += st.GetReceived()
-			if st.GetFamily().GetAfi() == apipb.Family_AFI_IP6 {
-				rxV6 += acc
-			} else {
-				rxV4 += acc
-			}
-		}
 
-		summaries = append(summaries, models.BGPNeighborSummary{
-			ViewID:           v.ID,
-			ViewName:         v.Name,
-			JunosContext:     fmt.Sprintf("%s %s", v.JunosContextType, v.VRFName),
-			NeighborIP:       peerAddr,
-			PeerASN:          peerASN,
-			SessionState:     stateStr,
-			Uptime:           uptimeStr,
-			AddPathRx:        true,
-			NextHopUnchanged: true,
-			PrefixesIPv4:     int(rxV4),
-			PrefixesIPv6:     int(rxV6),
-			UpdatesReceived:  int64(totalRx),
-		})
+			stateStr := "Idle"
+			switch matchedPeer.GetState().GetSessionState() {
+			case apipb.PeerState_ESTABLISHED:
+				stateStr = "Established"
+			case apipb.PeerState_ACTIVE:
+				stateStr = "Active"
+			case apipb.PeerState_CONNECT:
+				stateStr = "Connect"
+			case apipb.PeerState_OPENSENT:
+				stateStr = "OpenSent"
+			case apipb.PeerState_OPENCONFIRM:
+				stateStr = "OpenConfirm"
+			}
+
+			uptimeStr := "-"
+			if stateStr == "Established" && matchedPeer.GetTimers().GetState().GetUptime() != nil {
+				uptimeStr = formatGoBGPTimedelta(matchedPeer.GetTimers().GetState().GetUptime().AsTime())
+			}
+
+			var rxV4, rxV6, totalRx uint64
+			for _, afisafi := range matchedPeer.GetAfiSafis() {
+				st := afisafi.GetState()
+				if st == nil {
+					continue
+				}
+				acc := st.GetAccepted()
+				if acc == 0 {
+					acc = st.GetReceived()
+				}
+				totalRx += st.GetReceived()
+				if st.GetFamily().GetAfi() == apipb.Family_AFI_IP6 {
+					rxV6 += acc
+				} else {
+					rxV4 += acc
+				}
+			}
+
+			summaries = append(summaries, models.BGPNeighborSummary{
+				POP:              rrNode.Location,
+				RRNodeID:         rrNode.ID,
+				RRNodeName:       rrNode.Name,
+				EngineType:       "gobgp",
+				ViewID:           v.ID,
+				ViewName:         v.Name,
+				VRFName:          v.VRFName,
+				JunosContext:     fmt.Sprintf("%s %s", v.JunosContextType, v.VRFName),
+				NeighborIP:       peerAddr,
+				PeerASN:          peerASN,
+				SessionState:     stateStr,
+				Uptime:           uptimeStr,
+				AddPathRx:        true,
+				NextHopUnchanged: true,
+				PrefixesIPv4:     int(rxV4),
+				PrefixesIPv6:     int(rxV6),
+				UpdatesReceived:  int64(totalRx),
+			})
+		}
 	}
 
-	if len(summaries) == 0 {
-		return nil, false
-	}
 	return summaries, true
 }

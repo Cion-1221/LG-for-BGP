@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"lg-for-bgp/internal/api"
@@ -19,7 +23,7 @@ import (
 func main() {
 	configFile := flag.String("config", findDefaultConfigPath(), "Path to backend YAML configuration file (config.yaml)")
 	listenFlag := flag.String("listen", "", "Override HTTP API listen address (e.g. 127.0.0.1:8080)")
-	dbFlag := flag.String("db", "", "Override MySQL/MariaDB DSN")
+	dbFlag := flag.String("db", "", "Override database DSN (MySQL/MariaDB DSN or sqlite:/path/to/lg.db)")
 	adminPathFlag := flag.String("admin-path", "", "Override admin console URL path (e.g. /admin or /console)")
 	uiDirFlag := flag.String("ui-dir", "", "Optional path to built UI/dist directory")
 	flag.Parse()
@@ -45,7 +49,17 @@ func main() {
 		listenAddr = *listenFlag
 	}
 
-	dsn := cfg.MySQLDSN()
+	if v := os.Getenv("LG_DB_DRIVER"); v != "" {
+		cfg.Database.Driver = v
+	}
+	if v := os.Getenv("LG_DB_PATH"); v != "" {
+		cfg.Database.Path = v
+	}
+
+	dsn, err := cfg.DatabaseDSN()
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid database configuration: %v", err)
+	}
 	if v := os.Getenv("LG_DB_DSN"); v != "" {
 		dsn = v
 	}
@@ -67,10 +81,17 @@ func main() {
 		cfg.Server.UIDir = *uiDirFlag
 	}
 
+	if strings.TrimSpace(cfg.JWT.Secret) == "" || strings.Contains(cfg.JWT.Secret, "ChangeMe_") {
+		log.Println("[WARN] Security Notice: jwt.secret is using the default placeholder value! Generate a strong random secret (e.g. `openssl rand -hex 32`) in config.yaml.")
+	}
+
 	st, err := store.NewAppStore(dsn)
 	if err != nil {
 		log.Fatalf("[FATAL] Failed to initialize database store: %v", err)
 	}
+	defer func() {
+		_ = st.Close()
+	}()
 	st.SetJWTConfig(cfg.JWT.Secret, cfg.JWT.RefreshTokenDays)
 	st.SetConfiguredAdminPath(cfg.Server.AdminPath)
 	st.SetDBPoolOptions(store.DBPoolOptions{
@@ -79,11 +100,17 @@ func main() {
 		ConnMaxLifetimeMinutes: cfg.Database.ConnMaxLifetimeMinutes,
 		ConnMaxIdleTimeMinutes: cfg.Database.ConnMaxIdleTimeMinutes,
 	})
+	st.SetAuditRetention(cfg.Database.AuditRetentionDays, cfg.Database.AuditMaxRows)
 
 	cache := security.NewTTLCache()
+	defer cache.Close()
 	eng := bgp.NewEngine(st, cache)
 	srv := api.NewServer(st, eng, cache, cfg.Server.UIDir, cfg.Server.TrustedProxies...)
+	defer srv.Close()
 	srv.SetAccessLog(cfg.Log.AccessLog)
+	if len(cfg.Server.AllowedOrigins) > 0 {
+		srv.SetAllowedOrigins(cfg.Server.AllowedOrigins)
+	}
 
 	httpServer := &http.Server{
 		Addr:         listenAddr,
@@ -99,14 +126,44 @@ func main() {
 	log.Println("  LG-for-BGP Multi-Instance BGP Looking Glass API Server")
 	log.Println("================================================================================")
 	log.Printf("  YAML Config File   : %s", *configFile)
+	log.Printf("  Database Backend   : %s (Audit Retention: %dd / max %d rows)",
+		cfg.DatabaseSummary(dsn), cfg.Database.AuditRetentionDays, cfg.Database.AuditMaxRows)
 	log.Printf("  API Listen Address : http://%s", listenAddr)
 	log.Printf("  Admin Portal Path  : /%s", adminSettings.AdminSecretSlug)
 	log.Printf("  Log Directory      : %s (Active: %s.log, MaxAge: %dd, MaxBackups: %d, Compress: %v)",
 		cfg.Log.Dir, cfg.Log.Filename, cfg.Log.MaxAgeDays, cfg.Log.MaxBackups, cfg.Log.Compress)
 	log.Println("================================================================================")
 
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("[FATAL] HTTP server error: %v", err)
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			log.Fatalf("[FATAL] HTTP server error: %v", err)
+		}
+	case <-sigCtx.Done():
+		log.Println("[INFO] Received shutdown signal; draining active requests and flushing database...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[WARN] HTTP server graceful shutdown timeout: %v", err)
+		}
+		bgp.CloseAllGRPCConnections()
+		srv.Close()
+		cache.Close()
+		if err := st.Close(); err != nil {
+			log.Printf("[WARN] Database close error: %v", err)
+		}
+		log.Println("[INFO] lg-server stopped cleanly.")
 	}
 }
 
