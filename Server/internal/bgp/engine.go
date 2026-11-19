@@ -407,11 +407,11 @@ func (e *Engine) ExecuteLookup(ctx context.Context, req models.LookupRequest) (*
 	}
 	wg.Wait()
 
-	usedRRDisplay := fmt.Sprintf("%s (%s @ %s)", primaryRR.Name, primaryRR.LoopbackIP, primaryRR.Endpoint)
+	usedRRDisplay := primaryRR.Name
 	if len(results) > 0 && results[0].RRNodeID != "" {
 		for _, n := range allRRs {
 			if n.ID == results[0].RRNodeID {
-				usedRRDisplay = fmt.Sprintf("%s (%s @ %s)", n.Name, n.LoopbackIP, n.Endpoint)
+				usedRRDisplay = n.Name
 				if results[0].EngineType != "" {
 					engineUsed = results[0].EngineType
 				}
@@ -500,8 +500,8 @@ func (e *Engine) querySingleViewWithFailover(
 
 	rrNode := candidates[0]
 	failEng := strings.ToUpper(rrNode.EngineType)
-	errRaw := fmt.Sprintf("# Error: Unable to query Route Reflector %s [PoP: %s] (%s) via %s.\n# Please verify that the RR daemon (gobgpd gRPC / birdc / vtysh / lg-agent) is running and reachable at %s.\n",
-		rrNode.Name, rrNode.Location, rrNode.LoopbackIP, failEng, rrNode.Endpoint)
+	errRaw := fmt.Sprintf("# Error: Unable to query Route Reflector %s [PoP: %s] (%s).\n# The collector node is temporarily unreachable. Please retry shortly or contact the network operator.\n",
+		rrNode.Name, rrNode.Location, failEng)
 
 	return models.ViewQueryResult{
 		View:        view,

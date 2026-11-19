@@ -869,7 +869,8 @@ func (s *AppStore) GetRRNodes() []models.RRNodeConfig {
 	return out
 }
 
-// GetPublicRRNodes returns RR nodes with sensitive AgentToken fields stripped out.
+// GetPublicRRNodes returns RR nodes with sensitive internal fields (AgentToken, Endpoint, LoopbackIP) stripped out
+// so public visitors cannot discover internal collector / agent IPs or ports.
 func (s *AppStore) GetPublicRRNodes() []models.RRNodeConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -877,6 +878,8 @@ func (s *AppStore) GetPublicRRNodes() []models.RRNodeConfig {
 	for i, n := range s.data.RRNodes {
 		cp := n
 		cp.AgentToken = ""
+		cp.Endpoint = ""
+		cp.LoopbackIP = ""
 		out[i] = cp
 	}
 	return out

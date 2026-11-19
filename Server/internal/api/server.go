@@ -248,6 +248,12 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	adminEntryVerified := s.store.VerifyAdminSlug(entrySlug) || (isAdmin && entrySlug != "" && entrySlug != "/")
 
 	allViews := s.store.GetRouteViews()
+	if !isAdmin {
+		for i := range allViews {
+			allViews[i].JuniperSourceIPv4 = ""
+			allViews[i].JuniperSourceIPv6 = ""
+		}
+	}
 
 	var allowedIDs []models.RouteViewID
 	if user != nil {
@@ -494,42 +500,29 @@ func (s *Server) handleBGPLookup(w http.ResponseWriter, r *http.Request) {
 		DurationMs: time.Since(start).Milliseconds(),
 	})
 
+	if user == nil || user.Role != "admin" {
+		for i := range resp.Results {
+			resp.Results[i].View.JuniperSourceIPv4 = ""
+			resp.Results[i].View.JuniperSourceIPv6 = ""
+		}
+	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleBGPSummary(w http.ResponseWriter, r *http.Request) {
-	user, allowedViews, _, errMsg, status := s.resolveAccess(r)
-	if status != http.StatusOK {
-		writeError(w, status, errMsg)
+	if admin := s.requireAdmin(w, r); admin == nil {
 		return
 	}
 
-	allowedSet := make(map[models.RouteViewID]bool)
-	for _, v := range allowedViews {
-		allowedSet[v] = true
-	}
-
 	allNeighbors := s.engine.GetNeighborSummary()
-	var filtered []models.BGPNeighborSummary
-	for _, n := range allNeighbors {
-		if (user != nil && user.Role == "admin") || allowedSet[n.ViewID] {
-			filtered = append(filtered, n)
-		}
-	}
-	if filtered == nil {
-		filtered = []models.BGPNeighborSummary{}
-	}
-
-	var rrNodes []models.RRNodeConfig
-	if user != nil && user.Role == "admin" {
-		rrNodes = s.store.GetRRNodes()
-	} else {
-		rrNodes = s.store.GetPublicRRNodes()
+	if allNeighbors == nil {
+		allNeighbors = []models.BGPNeighborSummary{}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"rr_nodes":  rrNodes,
-		"neighbors": filtered,
+		"rr_nodes":  s.store.GetRRNodes(),
+		"neighbors": allNeighbors,
 		"timestamp": time.Now(),
 	})
 }

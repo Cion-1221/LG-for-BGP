@@ -731,8 +731,8 @@ func (e *Engine) RunLocalFrrQuery(
 			return results, parsed.Prefix, string(rawBytes), true
 		}
 		if vtyshAlive {
-			emptyRaw := fmt.Sprintf("# Node: %s (%s) | Engine: FRR\n# VRF: %s | Target: %s\nNetwork not in table.\n",
-				rrNode.Name, rrNode.LoopbackIP, vrfName, normalized)
+			emptyRaw := fmt.Sprintf("# Node: %s | Engine: FRR\n# VRF: %s | Target: %s\nNetwork not in table.\n",
+				rrNode.Name, vrfName, normalized)
 			return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
 		}
 		return nil, "", "", false
@@ -820,8 +820,8 @@ func (e *Engine) RunLocalFrrQuery(
 
 		if len(results) > 0 {
 			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("# Node: %s (%s) | Engine: FRR | VRF: %s | Filter: %s\n",
-				rrNode.Name, rrNode.LoopbackIP, vrfName, target))
+			sb.WriteString(fmt.Sprintf("# Node: %s | Engine: FRR | VRF: %s | Filter: %s\n",
+				rrNode.Name, vrfName, target))
 			sb.WriteString(fmt.Sprintf("   %-22s %-16s %-6s %-6s %s\n", "Network", "Next Hop", "LocPrf", "MED", "AS_PATH"))
 			for _, line := range rawLines {
 				sb.WriteString(line + "\n")
@@ -830,15 +830,15 @@ func (e *Engine) RunLocalFrrQuery(
 			return results, summaryLabel, sb.String(), true
 		}
 		if matchedAnyScope {
-			emptyRaw := fmt.Sprintf("# Node: %s (%s) | Engine: FRR\n# VRF: %s | Filter: %s\nNetwork not in table.\n",
-				rrNode.Name, rrNode.LoopbackIP, vrfName, target)
+			emptyRaw := fmt.Sprintf("# Node: %s | Engine: FRR\n# VRF: %s | Filter: %s\nNetwork not in table.\n",
+				rrNode.Name, vrfName, target)
 			return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
 		}
 	}
 
 	if vtyshAlive {
-		emptyRaw := fmt.Sprintf("# Node: %s (%s) | Engine: FRR\n# VRF: %s | Target: %s\nNetwork not in table.\n",
-			rrNode.Name, rrNode.LoopbackIP, vrfName, target)
+		emptyRaw := fmt.Sprintf("# Node: %s | Engine: FRR\n# VRF: %s | Target: %s\nNetwork not in table.\n",
+			rrNode.Name, vrfName, target)
 		return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
 	}
 	return nil, "", "", false

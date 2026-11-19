@@ -196,9 +196,6 @@ func main() {
 		if n := strings.TrimSpace(req.RRNodeName); n != "" {
 			queryNode.Name = n
 		}
-		if ip := strings.TrimSpace(req.RRLoopbackIP); ip != "" {
-			queryNode.LoopbackIP = ip
-		}
 
 		var (
 			paths   []models.BGPRoutePath

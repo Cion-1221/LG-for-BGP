@@ -249,8 +249,8 @@ func (e *Engine) queryLiveGoBGPgRPC(
 				return paths, matched, rawOut, true
 			}
 			if queryType != "prefix" {
-				emptyRaw := fmt.Sprintf("# Node: %s (%s @ %s) | Engine: GOBGP (gRPC)\n# VRF: %s (RD: %s) | Target: %s\nNetwork not in table.\n",
-					rrNode.Name, rrNode.LoopbackIP, rrNode.Endpoint, vrfName, rdStr, target)
+				emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table.\n",
+					rrNode.Name, vrfName, target)
 				return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
 			}
 		}
@@ -269,8 +269,8 @@ func (e *Engine) queryLiveGoBGPgRPC(
 				return paths, matched, rawOut, true
 			}
 			if queryType != "prefix" {
-				emptyRaw := fmt.Sprintf("# Node: %s (%s @ %s) | Engine: GOBGP (gRPC)\n# VRF: %s (RD: %s) | Target: %s\nNetwork not in table.\n",
-					rrNode.Name, rrNode.LoopbackIP, rrNode.Endpoint, vrfName, rdStr, target)
+				emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table.\n",
+					rrNode.Name, vrfName, target)
 				return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
 			}
 		}
@@ -285,8 +285,8 @@ func (e *Engine) queryLiveGoBGPgRPC(
 
 	// The gRPC server is reachable and alive, but no route matched in the RIB.
 	// Return an empty live result (`ok = true` with 0 paths) so we NEVER fall back to fake mock routes!
-	emptyRaw := fmt.Sprintf("# Node: %s (%s @ %s) | Engine: GOBGP (gRPC)\n# VRF: %s (RD: %s) | Target: %s\nNetwork not in table.\n",
-		rrNode.Name, rrNode.LoopbackIP, rrNode.Endpoint, vrfName, rdStr, target)
+	emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table.\n",
+		rrNode.Name, vrfName, target)
 	return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
 }
 

@@ -240,6 +240,38 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		t.Fatalf("expected 400 rejecting malicious SVG icon, got %d: %s", recSetBad.Code, recSetBad.Body.String())
 	}
 
+	// 10. Security verification: Public Portal bootstrap, lookup, and summary MUST NEVER leak RR/Agent IPs or endpoints!
+	reqBootPub := httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
+	recBootPub := httptest.NewRecorder()
+	handler.ServeHTTP(recBootPub, reqBootPub)
+	if recBootPub.Code != http.StatusOK {
+		t.Fatalf("public bootstrap failed: %d", recBootPub.Code)
+	}
+	bootPubBody := recBootPub.Body.String()
+	if bytes.Contains([]byte(bootPubBody), []byte("10.255.255.101")) || bytes.Contains([]byte(bootPubBody), []byte("127.0.0.1:50051")) {
+		t.Fatalf("public bootstrap leaked RR loopback IP or endpoint: %s", bootPubBody)
+	}
+
+	// Public lookup MUST NOT leak RR loopback IP or endpoint in rr_node_used or raw_output
+	reqLookupPub := httptest.NewRequest(http.MethodPost, "/api/v1/bgp/lookup", bytes.NewBufferString(`{"query_type":"prefix","target":"1.1.1.1","views":["lsys_opt"],"rr_node_id":"auto","engine":"auto"}`))
+	recLookupPub := httptest.NewRecorder()
+	handler.ServeHTTP(recLookupPub, reqLookupPub)
+	if recLookupPub.Code != http.StatusOK {
+		t.Fatalf("public lookup failed: %d %s", recLookupPub.Code, recLookupPub.Body.String())
+	}
+	lookupPubBody := recLookupPub.Body.String()
+	if bytes.Contains([]byte(lookupPubBody), []byte("10.255.255.101")) || bytes.Contains([]byte(lookupPubBody), []byte("127.0.0.1:50051")) {
+		t.Fatalf("public lookup leaked RR loopback IP or endpoint: %s", lookupPubBody)
+	}
+
+	// Public /api/v1/bgp/summary MUST be Admin Only (401 without admin token)
+	reqSumPub := httptest.NewRequest(http.MethodGet, "/api/v1/bgp/summary", nil)
+	recSumPub := httptest.NewRecorder()
+	handler.ServeHTTP(recSumPub, reqSumPub)
+	if recSumPub.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /api/v1/bgp/summary, got %d", recSumPub.Code)
+	}
+
 	srv.Close()
 	cache.Close()
 	_ = st.Close()
