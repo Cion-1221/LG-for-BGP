@@ -3,6 +3,7 @@ import { api, BootstrapResponse, setToken } from './api';
 import {
   AuditLogEntry,
   BGPNeighborSummary,
+  LoginLockEntry,
   LookupResponse,
   POPGroup,
   RouteViewID,
@@ -82,8 +83,12 @@ export const App: React.FC = () => {
 
   // Admin Console States
   const [neighbors, setNeighbors] = useState<BGPNeighborSummary[]>([]);
+  const [neighborsLoading, setNeighborsLoading] = useState(false);
+  const [neighborsUpdatedAt, setNeighborsUpdatedAt] = useState<string>('');
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
+  const [loginLocks, setLoginLocks] = useState<LoginLockEntry[]>([]);
+  const [unbanInput, setUnbanInput] = useState('');
   const [auditPage, setAuditPage] = useState<number>(1);
   const [auditPageSize, setAuditPageSize] = useState<number>(20);
   const [adminMsg, setAdminMsg] = useState('');
@@ -99,8 +104,9 @@ export const App: React.FC = () => {
     id: '',
     name: '',
     vrf_name: '',
-    type: 'gobgp',
+    type: 'auto',
     pop: '',
+    rr_node_ids: ['all'],
     short_name: '',
     junos_context_type: 'routing-instances',
     junos_context_name: '',
@@ -121,6 +127,7 @@ export const App: React.FC = () => {
     engine_type: 'gobgp',
     loopback_ip: '',
     endpoint: '127.0.0.1:50051',
+    agent_token: '',
     role: 'primary',
     enabled: true,
     healthy: true,
@@ -208,17 +215,34 @@ export const App: React.FC = () => {
     }
   }, [activePOPGroups, selectedPOP]);
 
-  // Strictly show only permitted VRF views belonging to the currently selected PoP
-  // (or explicitly marked 'all'). NEVER fall back to showing another PoP's VRFs.
+  // Helper: check whether a VRF route view is bound to a specific RR node
+  const isViewBoundToRR = (v: RouteViewMeta, rr: RRNodeConfig): boolean => {
+    const ids = v.rr_node_ids || [];
+    if (ids.length > 0) {
+      return ids.some((id) => id.toLowerCase() === 'all' || id === rr.id);
+    }
+    // Legacy fallback before rr_node_ids migration
+    const vPop = (v.pop || '').trim().toLowerCase();
+    if (vPop === 'none') return false;
+    if (!vPop || vPop === 'all') return true;
+    return vPop === (rr.location || '').trim().toLowerCase();
+  };
+
+  // Strictly show ONLY permitted VRF views bound to at least 1 enabled RR in the currently selected PoP.
+  // NEVER fall back to showing another PoP's VRFs.
   const visiblePermittedViews = useMemo(() => {
     if (!boot) return [];
     const allPermitted = boot.permitted_views || [];
     if (!selectedPOP) return allPermitted;
     const targetPop = selectedPOP.trim().toLowerCase();
-    return allPermitted.filter((v) => {
-      const vPop = (v.pop || '').trim().toLowerCase();
-      return vPop === '' || vPop === 'all' || vPop === targetPop;
-    });
+    const popRRs = (boot.rr_nodes || []).filter(
+      (n) => n.enabled && (n.location || '').trim().toLowerCase() === targetPop
+    );
+    if (popRRs.length === 0) {
+      // No enabled RR in this PoP -> show no VRFs (do not leak other PoPs' VRFs)
+      return [];
+    }
+    return allPermitted.filter((v) => popRRs.some((rr) => isViewBoundToRR(v, rr)));
   }, [boot, selectedPOP]);
 
   useEffect(() => {
@@ -370,19 +394,38 @@ export const App: React.FC = () => {
     }, 1800);
   };
 
+  const refreshNeighbors = async () => {
+    setNeighborsLoading(true);
+    try {
+      const sum = await api.getSummary();
+      setNeighbors(sum.neighbors || []);
+      setNeighborsUpdatedAt(new Date().toLocaleTimeString());
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setNeighborsLoading(false);
+    }
+  };
+
   const loadAdminData = async () => {
     if (boot?.current_user?.role !== 'admin') return;
+    setNeighborsLoading(true);
     try {
-      const [uList, logs, sum] = await Promise.all([
+      const [uList, logs, locks, sum] = await Promise.all([
         api.getUsers(),
         api.getAuditLogs(),
+        api.getLoginLocks().catch(() => []),
         api.getSummary().catch(() => ({ neighbors: [] })),
       ]);
       setUsers(uList || []);
       setAuditLogs(logs || []);
+      setLoginLocks(locks || []);
       setNeighbors(sum.neighbors || []);
+      setNeighborsUpdatedAt(new Date().toLocaleTimeString());
     } catch (e) {
       console.error(e);
+    } finally {
+      setNeighborsLoading(false);
     }
   };
 
@@ -601,6 +644,13 @@ export const App: React.FC = () => {
     popNameByID.set(p.id.toUpperCase(), p.name);
   }
 
+  const rrNodeByID = new Map<string, RRNodeConfig>();
+  for (const n of boot.rr_nodes || []) {
+    rrNodeByID.set(n.id, n);
+  }
+
+  const activeLockedCount = loginLocks.filter((l) => l.locked).length;
+
   // Group RR nodes by PoP for Admin Console
   const rrsByPOP = new Map<string, RRNodeConfig[]>();
   for (const n of boot.rr_nodes || []) {
@@ -758,7 +808,11 @@ export const App: React.FC = () => {
                   label: '4. User Accounts & RBAC',
                   badge: String(users.length),
                 },
-                { id: 'logs', label: '5. Audit Logs & Cache', badge: '' },
+                {
+                  id: 'logs',
+                  label: '5. Security, Audit & Cache',
+                  badge: activeLockedCount > 0 ? `${activeLockedCount} locked` : '',
+                },
               ] as const
             ).map((item) => (
               <button
@@ -1013,7 +1067,17 @@ export const App: React.FC = () => {
                               />
                               <span className={`font-semibold ${textPrimary}`}>{v.name}</span>
                               <span className="text-sky-700 dark:text-sky-400 font-mono text-[11px] ml-auto">
-                                {v.vrf_name} ({v.pop && v.pop !== 'all' ? v.pop : 'ALL PoPs'})
+                                {v.vrf_name} (
+                                {v.rr_node_ids && v.rr_node_ids.length > 0
+                                  ? v.rr_node_ids.includes('all')
+                                    ? 'ALL RRs'
+                                    : v.rr_node_ids
+                                        .map((id) => rrNodeByID.get(id)?.name || id)
+                                        .join(', ')
+                                  : v.pop && v.pop !== 'all'
+                                    ? v.pop
+                                    : 'ALL'}
+                                )
                               </span>
                             </label>
                           );
@@ -1032,18 +1096,52 @@ export const App: React.FC = () => {
               </div>
             )}
 
-            {/* SECTION 2: VRF / ROUTING TABLES (WITH POP DROPDOWN) */}
+            {/* SECTION 2: VRF / ROUTING TABLES (BOUND TO 1, MULTIPLE, OR ALL RR NODES) */}
             {adminSection === 'views' && (
               <div className={`${bgCard} border rounded-2xl p-6 space-y-6 text-xs`}>
-                <div>
-                  <h2 className={`text-base font-bold ${textPrimary} mb-1`}>
-                    VRF / Routing Table Management
-                  </h2>
-                  <p className={textSecondary}>
-                    Configure Frontend Display Name (<b>Name</b>), Underlying RIB / VRF Name (
-                    <b>VRF Name</b> — leave blank or enter <code className="text-sky-700 dark:text-sky-400">global</code>{' '}
-                    for a single global table), Query Engine (<b>Type</b>), and <b>PoP Group Scope</b>.
-                  </p>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h2 className={`text-base font-bold ${textPrimary} mb-1`}>
+                      VRF / Routing Table Management (Bound to RR Nodes)
+                    </h2>
+                    <p className={textSecondary}>
+                      Bind each VRF / RIB table to <b>1 RR node</b>, <b>multiple RR nodes</b>, or{' '}
+                      <b>All RR Nodes</b>. Each RR node belongs to a single PoP, so switching PoPs on
+                      the public portal automatically shows only VRFs bound to that PoP&apos;s RRs.
+                      Leave <b>VRF Name</b> blank or enter{' '}
+                      <code className="text-sky-700 dark:text-sky-400">global</code> for a single
+                      global table.
+                    </p>
+                  </div>
+                  {editingView.id && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setEditingView({
+                          id: '',
+                          name: '',
+                          vrf_name: '',
+                          type: 'auto',
+                          pop: '',
+                          rr_node_ids: ['all'],
+                          short_name: '',
+                          junos_context_type: 'routing-instances',
+                          junos_context_name: '',
+                          junos_table: '',
+                          juniper_source_ipv4: '',
+                          juniper_source_ipv6: '',
+                          bird_table_v4: '',
+                          bird_table_v6: '',
+                          frr_view_name: '',
+                          description: '',
+                          badge_color: 'blue',
+                        })
+                      }
+                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold shrink-0"
+                    >
+                      + New VRF Form
+                    </button>
+                  )}
                 </div>
 
                 {boot.all_views.length === 0 ? (
@@ -1052,65 +1150,105 @@ export const App: React.FC = () => {
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-                    {boot.all_views.map((v) => (
-                      <div
-                        key={v.id}
-                        className={`p-4 rounded-xl border flex justify-between items-start gap-3 ${bgSubCard}`}
-                      >
-                        <div className="space-y-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className={`font-bold text-sm ${textPrimary}`}>{v.name}</span>
-                            <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 font-mono uppercase font-semibold">
-                              {v.type === 'gobgp' ? 'GOBGP (gRPC)' : v.type}
-                            </span>
-                            <span className="text-[10px] px-2 py-0.5 rounded bg-sky-500/15 text-sky-700 dark:text-sky-400 border border-sky-500/30 font-mono">
-                              PoP: {v.pop && v.pop !== 'all' ? v.pop : 'ALL PoPs'}
-                            </span>
-                          </div>
-                          <div className="font-mono text-sky-700 dark:text-sky-400">
-                            VRF Name: <span className={textPrimary}>{v.vrf_name}</span> · ID: {v.id}
-                          </div>
-                          {v.juniper_source_ipv4 && (
-                            <div className={`font-mono ${textSecondary}`}>
-                              Neighbor Peer IP: {v.juniper_source_ipv4}
+                    {boot.all_views.map((v) => {
+                      const boundIDs = v.rr_node_ids || [];
+                      const isAllRRs =
+                        boundIDs.length === 1 && boundIDs[0].toLowerCase() === 'all';
+                      return (
+                        <div
+                          key={v.id}
+                          className={`p-4 rounded-xl border flex justify-between items-start gap-3 ${bgSubCard}`}
+                        >
+                          <div className="space-y-1.5">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className={`font-bold text-sm ${textPrimary}`}>{v.name}</span>
+                              <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 font-mono uppercase font-semibold">
+                                {!v.type || v.type === 'auto'
+                                  ? 'AUTO (FOLLOW RR)'
+                                  : v.type === 'gobgp'
+                                    ? 'GOBGP (gRPC)'
+                                    : v.type}
+                              </span>
                             </div>
-                          )}
-                          {v.description && <div className={textSecondary}>{v.description}</div>}
-                        </div>
-                        <div className="flex gap-1.5 shrink-0">
-                          <button
-                            onClick={() =>
-                              setEditingView({
-                                ...v,
-                                vrf_name: v.vrf_name || v.junos_context_name || '',
-                                type: v.type || 'gobgp',
-                                pop: v.pop || 'all',
-                              })
-                            }
-                            className="px-2.5 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-400 font-medium"
-                          >
-                            Edit
-                          </button>
-                          <button
-                            onClick={async () => {
-                              try {
-                                await api.deleteRouteView(v.id);
-                                setAdminMsg(`Deleted VRF table ${v.name}`);
-                                await loadBootstrap();
-                                await loadAdminData();
-                              } catch (err: unknown) {
-                                setAdminMsg(
-                                  err instanceof Error ? err.message : 'Delete failed'
-                                );
+                            <div className="font-mono text-sky-700 dark:text-sky-400">
+                              VRF Name: <span className={textPrimary}>{v.vrf_name}</span> · ID:{' '}
+                              {v.id}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                              <span className={`font-medium ${textSecondary}`}>Bound RRs:</span>
+                              {isAllRRs ? (
+                                <span
+                                  className={`text-[10px] px-2 py-0.5 rounded border font-mono font-semibold ${badgeSky}`}
+                                >
+                                  ALL RR Nodes
+                                </span>
+                              ) : boundIDs.length === 0 ? (
+                                <span
+                                  className={`text-[10px] px-2 py-0.5 rounded border font-mono font-semibold ${badgeAmber}`}
+                                >
+                                  Unbound (Select RR)
+                                </span>
+                              ) : (
+                                boundIDs.map((rid) => {
+                                  const rr = rrNodeByID.get(rid);
+                                  return (
+                                    <span
+                                      key={rid}
+                                      className={`text-[10px] px-2 py-0.5 rounded border font-mono ${badgeSky}`}
+                                    >
+                                      {rr
+                                        ? `${popNameByID.get(rr.location.toUpperCase()) || rr.location} · ${rr.name} [${rr.engine_type}]`
+                                        : rid}
+                                    </span>
+                                  );
+                                })
+                              )}
+                            </div>
+                            {v.juniper_source_ipv4 && (
+                              <div className={`font-mono ${textSecondary}`}>
+                                Neighbor Peer IP Filter: {v.juniper_source_ipv4}
+                              </div>
+                            )}
+                            {v.description && <div className={textSecondary}>{v.description}</div>}
+                          </div>
+                          <div className="flex gap-1.5 shrink-0">
+                            <button
+                              onClick={() =>
+                                setEditingView({
+                                  ...v,
+                                  vrf_name: v.vrf_name || v.junos_context_name || '',
+                                  type: v.type || 'auto',
+                                  rr_node_ids:
+                                    v.rr_node_ids && v.rr_node_ids.length > 0
+                                      ? [...v.rr_node_ids]
+                                      : ['all'],
+                                })
                               }
-                            }}
-                            className="px-2.5 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 font-medium"
-                          >
-                            Delete
-                          </button>
+                              className="px-2.5 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-400 font-medium"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              onClick={async () => {
+                                try {
+                                  await api.deleteRouteView(v.id);
+                                  setAdminMsg(`Deleted VRF table ${v.name}`);
+                                  await loadBootstrap();
+                                  await loadAdminData();
+                                } catch (err: unknown) {
+                                  setAdminMsg(
+                                    err instanceof Error ? err.message : 'Delete failed'
+                                  );
+                                }
+                              }}
+                              className="px-2.5 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 font-medium"
+                            >
+                              Delete
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
 
@@ -1119,12 +1257,15 @@ export const App: React.FC = () => {
                     e.preventDefault();
                     try {
                       const vrfVal = editingView.vrf_name.trim() || 'global';
-                      const popVal =
-                        (editingView.pop || '').trim() || configuredPOPGroups[0]?.id || 'all';
+                      const rrIDs =
+                        editingView.rr_node_ids && editingView.rr_node_ids.length > 0
+                          ? editingView.rr_node_ids
+                          : ['all'];
                       const payload: RouteViewMeta = {
                         ...editingView,
                         vrf_name: vrfVal,
-                        pop: popVal,
+                        type: editingView.type || 'auto',
+                        rr_node_ids: rrIDs,
                         short_name: vrfVal === 'global' ? 'GLOBAL' : vrfVal,
                         junos_context_name: vrfVal,
                         junos_table: `${vrfVal}.inet.0`,
@@ -1133,14 +1274,15 @@ export const App: React.FC = () => {
                       };
                       await api.saveRouteView(payload);
                       setAdminMsg(
-                        `Saved VRF table: ${editingView.name} (${vrfVal} · PoP: ${popVal})`
+                        `Saved VRF table: ${editingView.name} (${vrfVal} · RRs: ${rrIDs.join(', ')})`
                       );
                       setEditingView({
                         id: '',
                         name: '',
                         vrf_name: '',
-                        type: 'gobgp',
-                        pop: configuredPOPGroups[0]?.id || 'all',
+                        type: 'auto',
+                        pop: '',
+                        rr_node_ids: ['all'],
                         short_name: '',
                         junos_context_type: 'routing-instances',
                         junos_context_name: '',
@@ -1162,9 +1304,11 @@ export const App: React.FC = () => {
                   className={`pt-5 border-t ${borderSubtle} space-y-4`}
                 >
                   <h3 className={`text-sm font-bold ${textPrimary}`}>
-                    Add or Update VRF / Routing Table
+                    {editingView.id
+                      ? `Edit VRF / Routing Table (${editingView.id})`
+                      : 'Add New VRF / Routing Table'}
                   </h3>
-                  <div className="grid grid-cols-1 md:grid-cols-5 gap-3.5">
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3.5">
                     <div>
                       <label className={`block font-medium mb-1 ${textSecondary}`}>
                         1. Display Name (Name) *
@@ -1199,38 +1343,22 @@ export const App: React.FC = () => {
                     </div>
                     <div>
                       <label className={`block font-medium mb-1 ${textSecondary}`}>
-                        3. Engine Type (Type) *
+                        3. Engine Mode
                       </label>
                       <select
-                        value={editingView.type || 'gobgp'}
+                        value={editingView.type || 'auto'}
                         onChange={(e) => setEditingView({ ...editingView, type: e.target.value })}
                         className={`w-full px-3 py-2 rounded-lg border font-mono ${bgInput}`}
                       >
+                        <option value="auto">auto (Follow Bound RR&apos;s Engine)</option>
                         <option value="gobgp">gobgp (GoBGP gRPC)</option>
                         <option value="bird2">bird2 (BIRD 2 Table)</option>
-                        <option value="frr">frr (FRR BGP View)</option>
+                        <option value="frr">frr (FRR View / VyOS VRF)</option>
                       </select>
                     </div>
                     <div>
                       <label className={`block font-medium mb-1 ${textSecondary}`}>
-                        4. PoP Group Scope *
-                      </label>
-                      <select
-                        value={editingView.pop || configuredPOPGroups[0]?.id || 'all'}
-                        onChange={(e) => setEditingView({ ...editingView, pop: e.target.value })}
-                        className={`w-full px-3 py-2 rounded-lg border font-mono ${bgInput}`}
-                      >
-                        {configuredPOPGroups.map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.name} ({p.id})
-                          </option>
-                        ))}
-                        <option value="all">all (Shared Across All PoPs)</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className={`block font-medium mb-1 ${textSecondary}`}>
-                        5. Neighbor Peer IPv4
+                        4. Neighbor Peer IPv4 (Optional)
                       </label>
                       <input
                         type="text"
@@ -1238,11 +1366,104 @@ export const App: React.FC = () => {
                         onChange={(e) =>
                           setEditingView({ ...editingView, juniper_source_ipv4: e.target.value })
                         }
-                        placeholder="e.g. 192.168.0.46"
+                        placeholder="Leave blank to match by VRF name"
                         className={`w-full px-3 py-2 rounded-lg border font-mono ${bgInput}`}
                       />
                     </div>
                   </div>
+
+                  {/* MULTI-RR BINDING SELECTOR */}
+                  <div>
+                    <label className={`block font-medium mb-2 ${textSecondary}`}>
+                      5. Bound RR Collector Nodes * (Bind to 1 RR, multiple RRs, or All RR Nodes)
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                      {(() => {
+                        const curIDs = editingView.rr_node_ids || [];
+                        const isAll = curIDs.length === 1 && curIDs[0].toLowerCase() === 'all';
+                        return (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setEditingView({
+                                  ...editingView,
+                                  rr_node_ids: isAll
+                                    ? boot.rr_nodes.length > 0
+                                      ? [boot.rr_nodes[0].id]
+                                      : ['all']
+                                    : ['all'],
+                                })
+                              }
+                              className={`px-3 py-2 rounded-xl border font-semibold transition flex items-center gap-2 ${
+                                isAll
+                                  ? 'bg-indigo-600 text-white border-indigo-500 shadow-sm'
+                                  : `${bgSubCard} ${textPrimary} hover:opacity-85`
+                              }`}
+                            >
+                              <span>{isAll ? '✓' : '○'}</span>
+                              <span>All RR Nodes</span>
+                            </button>
+
+                            {boot.rr_nodes.map((rr) => {
+                              const checked = !isAll && curIDs.includes(rr.id);
+                              const popLabel =
+                                popNameByID.get(rr.location.toUpperCase()) || rr.location;
+                              return (
+                                <button
+                                  key={rr.id}
+                                  type="button"
+                                  onClick={() => {
+                                    const base = isAll ? [] : [...curIDs];
+                                    const next = checked
+                                      ? base.filter((id) => id !== rr.id)
+                                      : [...base, rr.id];
+                                    setEditingView({
+                                      ...editingView,
+                                      rr_node_ids: next.length > 0 ? next : ['all'],
+                                    });
+                                  }}
+                                  className={`px-3 py-2 rounded-xl border transition flex items-center gap-2 ${
+                                    checked
+                                      ? isDark
+                                        ? 'bg-sky-500/20 border-sky-500 text-white shadow-sm'
+                                        : 'bg-sky-50 border-sky-500 text-sky-950 shadow-sm'
+                                      : `${bgSubCard} ${textSecondary} hover:opacity-90`
+                                  }`}
+                                >
+                                  <span
+                                    className={`w-3.5 h-3.5 rounded flex items-center justify-center border text-[10px] ${
+                                      checked
+                                        ? 'bg-sky-600 border-sky-500 text-white font-bold'
+                                        : isDark
+                                          ? 'border-slate-600'
+                                          : 'border-slate-400 bg-white'
+                                    }`}
+                                  >
+                                    {checked ? '✓' : ''}
+                                  </span>
+                                  <span className={`font-semibold ${checked ? '' : textPrimary}`}>
+                                    {rr.name}
+                                  </span>
+                                  <span
+                                    className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${badgeSky}`}
+                                  >
+                                    {popLabel}
+                                  </span>
+                                  <span
+                                    className={`text-[10px] font-mono uppercase ${textSecondary}`}
+                                  >
+                                    {rr.engine_type}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </>
+                        );
+                      })()}
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-1 md:grid-cols-4 gap-3.5">
                     <div>
                       <label className={`block font-medium mb-1 ${textSecondary}`}>
@@ -1443,6 +1664,7 @@ export const App: React.FC = () => {
                           engine_type: 'gobgp',
                           loopback_ip: '127.0.0.1',
                           endpoint: '127.0.0.1:50051',
+                          agent_token: '',
                           role: boot.rr_nodes.length === 0 ? 'primary' : 'backup',
                           enabled: true,
                           healthy: true,
@@ -1546,7 +1768,7 @@ export const App: React.FC = () => {
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => setEditingRR(n)}
+                                    onClick={() => setEditingRR({ ...n, agent_token: n.agent_token || '' })}
                                     className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-400 font-medium"
                                   >
                                     Edit
@@ -1676,17 +1898,21 @@ export const App: React.FC = () => {
                             let nextEndpoint = editingRR.endpoint;
                             if (
                               nextEngine === 'gobgp' &&
-                              (!nextEndpoint || nextEndpoint.startsWith('/'))
+                              (!nextEndpoint ||
+                                nextEndpoint.startsWith('/') ||
+                                nextEndpoint.startsWith('http'))
                             ) {
                               nextEndpoint = '127.0.0.1:50051';
                             } else if (
                               nextEngine === 'bird2' &&
-                              (!nextEndpoint || nextEndpoint.includes(':'))
+                              (!nextEndpoint ||
+                                (nextEndpoint.includes(':') && !nextEndpoint.startsWith('http')))
                             ) {
                               nextEndpoint = '/run/bird/bird.ctl';
                             } else if (
                               nextEngine === 'frr' &&
-                              (!nextEndpoint || nextEndpoint.includes(':'))
+                              (!nextEndpoint ||
+                                (nextEndpoint.includes(':') && !nextEndpoint.startsWith('http')))
                             ) {
                               nextEndpoint = '/run/frr';
                             }
@@ -1699,8 +1925,8 @@ export const App: React.FC = () => {
                           className={`w-full px-3 py-2 rounded-lg border font-mono ${bgInput}`}
                         >
                           <option value="gobgp">gobgp (GoBGP Native gRPC)</option>
-                          <option value="bird2">bird2 (BIRD 2 Control Socket)</option>
-                          <option value="frr">frr (FRRouting vtysh JSON)</option>
+                          <option value="bird2">bird2 (BIRD 2 Socket or lg-agent)</option>
+                          <option value="frr">frr (FRR/VyOS vtysh or lg-agent)</option>
                         </select>
                       </div>
                       <div>
@@ -1709,8 +1935,8 @@ export const App: React.FC = () => {
                           {editingRR.engine_type === 'gobgp'
                             ? 'GoBGP gRPC Endpoint (host:port) *'
                             : editingRR.engine_type === 'bird2'
-                              ? 'BIRD 2 Control Socket Path *'
-                              : 'FRR vtysh Socket Directory *'}
+                              ? 'BIRD 2 Socket Path or lg-agent URL *'
+                              : 'FRR Socket Dir or lg-agent URL *'}
                         </label>
                         <input
                           type="text"
@@ -1723,15 +1949,15 @@ export const App: React.FC = () => {
                             editingRR.engine_type === 'gobgp'
                               ? 'e.g. 127.0.0.1:50051'
                               : editingRR.engine_type === 'bird2'
-                                ? 'e.g. /run/bird/bird.ctl'
-                                : 'e.g. /run/frr'
+                                ? 'e.g. /run/bird/bird.ctl or http://10.0.0.2:9090'
+                                : 'e.g. /run/frr or http://10.0.0.2:9090'
                           }
                           className={`w-full px-3 py-2 rounded-lg border font-mono ${bgInput}`}
                         />
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3.5 items-end">
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-3.5 items-end">
                       <div>
                         <label className={`block font-medium mb-1 ${textSecondary}`}>
                           5. RR Loopback IP *
@@ -1772,6 +1998,20 @@ export const App: React.FC = () => {
                           className={`w-full px-3 py-2 rounded-lg border font-mono ${bgInput}`}
                         />
                       </div>
+                      <div>
+                        <label className={`block font-medium mb-1 ${textSecondary}`}>
+                          8. lg-agent Token (Remote BIRD/FRR)
+                        </label>
+                        <input
+                          type="password"
+                          value={editingRR.agent_token || ''}
+                          onChange={(e) =>
+                            setEditingRR({ ...editingRR, agent_token: e.target.value })
+                          }
+                          placeholder="Optional Bearer token"
+                          className={`w-full px-3 py-2 rounded-lg border font-mono ${bgInput}`}
+                        />
+                      </div>
                       <div className="flex items-center gap-3">
                         <label
                           className={`flex items-center gap-1.5 cursor-pointer shrink-0 ${textPrimary}`}
@@ -1796,23 +2036,33 @@ export const App: React.FC = () => {
                   </form>
                 </div>
 
-                {/* Live BGP Neighbor Session Summary inside Admin Console */}
+                {/* Live BGP Neighbor Session Summary inside Admin Console (Grouped by PoP + RR + VRF) */}
                 <div className={`${bgCard} border rounded-2xl p-6 overflow-x-auto`}>
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className={`text-sm font-bold ${textPrimary}`}>
-                      Live iBGP Neighbor Session Summary (Admin Only)
-                    </h3>
+                  <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+                    <div>
+                      <h3 className={`text-sm font-bold ${textPrimary}`}>
+                        Live iBGP Neighbor Session Summary (Admin Only)
+                      </h3>
+                      <p className={`text-[11px] ${textSecondary} mt-0.5`}>
+                        Queries live BGP neighbor sessions per (PoP · RR Node · Bound VRF) across
+                        GoBGP gRPC, BIRD 2, and FRR.
+                        {neighborsUpdatedAt ? ` Last refreshed: ${neighborsUpdatedAt}` : ''}
+                      </p>
+                    </div>
                     <button
                       type="button"
-                      onClick={loadAdminData}
-                      className="px-3 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-400 font-medium"
+                      disabled={neighborsLoading}
+                      onClick={refreshNeighbors}
+                      className={`px-3.5 py-1.5 rounded-lg border font-semibold transition disabled:opacity-50 ${badgeSky}`}
                     >
-                      Refresh Peers
+                      {neighborsLoading ? 'Refreshing Peers...' : '↻ Refresh Peers'}
                     </button>
                   </div>
                   <table className="w-full text-left text-xs">
                     <thead>
                       <tr className={`border-b border-slate-200 dark:border-slate-800/70 ${textSecondary}`}>
+                        <th className="py-2.5 px-3">PoP</th>
+                        <th className="py-2.5 px-3">RR Node</th>
                         <th className="py-2.5 px-3">Route View</th>
                         <th className="py-2.5 px-3">VRF / Instance</th>
                         <th className="py-2.5 px-3">Neighbor IP</th>
@@ -1825,38 +2075,67 @@ export const App: React.FC = () => {
                     <tbody className="divide-y divide-slate-200 dark:divide-slate-800/60 font-mono">
                       {neighbors.length === 0 ? (
                         <tr>
-                          <td colSpan={7} className={`py-4 text-center font-sans ${textSecondary}`}>
-                            No neighbor sessions available.
+                          <td colSpan={9} className={`py-4 text-center font-sans ${textSecondary}`}>
+                            No bound RR / VRF neighbor sessions configured.
                           </td>
                         </tr>
                       ) : (
-                        neighbors.map((n) => (
-                          <tr key={n.view_id}>
-                            <td className={`py-2.5 px-3 font-sans font-semibold ${textPrimary}`}>
-                              {n.view_name}
-                            </td>
-                            <td className="py-2.5 px-3 text-sky-700 dark:text-sky-400">{n.junos_context}</td>
-                            <td className="py-2.5 px-3 text-amber-700 dark:text-amber-400">{n.neighbor_ip || '-'}</td>
-                            <td className="py-2.5 px-3">
-                              <span
-                                className={`px-2 py-0.5 rounded text-[11px] ${
-                                  n.session_state === 'Established'
-                                    ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-400'
-                                    : 'bg-rose-500/20 text-rose-500'
-                                }`}
-                              >
-                                {n.session_state}
-                              </span>
-                            </td>
-                            <td className={`py-2.5 px-3 ${textPrimary}`}>
-                              {n.prefixes_ipv4.toLocaleString()}
-                            </td>
-                            <td className={`py-2.5 px-3 ${textPrimary}`}>
-                              {n.prefixes_ipv6.toLocaleString()}
-                            </td>
-                            <td className={`py-2.5 px-3 ${textSecondary}`}>{n.uptime}</td>
-                          </tr>
-                        ))
+                        neighbors.map((n, idx) => {
+                          const isEst = n.session_state === 'Established';
+                          const isIdle =
+                            n.session_state === 'No Peer / Idle' ||
+                            n.session_state === 'No Bound RR';
+                          return (
+                            <tr
+                              key={`${n.rr_node_id || 'unbound'}::${n.view_id}::${n.neighbor_ip || 'none'}::${idx}`}
+                            >
+                              <td className="py-2.5 px-3">
+                                <span
+                                  className={`px-2 py-0.5 rounded border text-[10px] font-semibold ${badgeSky}`}
+                                >
+                                  {n.pop
+                                    ? popNameByID.get(n.pop.toUpperCase()) || n.pop
+                                    : '-'}
+                                </span>
+                              </td>
+                              <td className={`py-2.5 px-3 ${textPrimary}`}>
+                                <span className="font-semibold">{n.rr_node_name || '-'}</span>
+                                {n.engine_type && (
+                                  <span
+                                    className={`ml-1.5 text-[10px] uppercase ${textSecondary}`}
+                                  >
+                                    [{n.engine_type}]
+                                  </span>
+                                )}
+                              </td>
+                              <td className={`py-2.5 px-3 font-sans font-semibold ${textPrimary}`}>
+                                {n.view_name}
+                              </td>
+                              <td className="py-2.5 px-3 text-sky-700 dark:text-sky-400">
+                                {n.vrf_name || n.junos_context}
+                              </td>
+                              <td className="py-2.5 px-3 text-amber-700 dark:text-amber-400">
+                                {n.neighbor_ip || '-'}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <span
+                                  className={`px-2 py-0.5 rounded border text-[11px] font-semibold ${
+                                    isEst ? badgeEmerald : isIdle ? badgeAmber : badgeRose
+                                  }`}
+                                >
+                                  {n.session_state}
+                                </span>
+                              </td>
+                              <td className={`py-2.5 px-3 ${textPrimary}`}>
+                                {n.prefixes_ipv4.toLocaleString()}
+                              </td>
+                              <td className={`py-2.5 px-3 ${textPrimary}`}>
+                                {n.prefixes_ipv6.toLocaleString()}
+                              </td>
+                              <td className={`py-2.5 px-3 ${textSecondary}`}>{n.uptime}</td>
+                            </tr>
+                          );
+                        })
                       )}
                     </tbody>
                   </table>
@@ -2146,7 +2425,7 @@ export const App: React.FC = () => {
               </div>
             )}
 
-            {/* SECTION 5: AUDIT LOGS & CACHE (WITH PAGINATION & PAGE SIZE) */}
+            {/* SECTION 5: LOGIN SECURITY (MANUAL UNBAN), AUDIT LOGS & CACHE */}
             {adminSection === 'logs' && (() => {
               const totalLogs = auditLogs.length;
               const totalPages = Math.max(1, Math.ceil(totalLogs / auditPageSize));
@@ -2155,7 +2434,149 @@ export const App: React.FC = () => {
               const pagedLogs = auditLogs.slice(startIdx, startIdx + auditPageSize);
 
               return (
-                <div className={`${bgCard} border rounded-2xl p-6 space-y-4 text-xs`}>
+                <div className="space-y-6 text-xs">
+                  {/* LOGIN BRUTE-FORCE PROTECTION & MANUAL UNBAN */}
+                  <div className={`${bgCard} border rounded-2xl p-6 space-y-4`}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h2 className={`text-base font-bold ${textPrimary}`}>
+                          Login Brute-Force Protection & Manual Unban
+                        </h2>
+                        <p className={`text-[11px] ${textSecondary} mt-0.5`}>
+                          Automatically locks an IP or username for 15 minutes after 5 consecutive
+                          failed logins. Manually unban any locked IP or account below.
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <form
+                          onSubmit={async (e) => {
+                            e.preventDefault();
+                            const targetKey = unbanInput.trim();
+                            if (!targetKey) return;
+                            try {
+                              const res = await api.unbanLoginLock(targetKey);
+                              setLoginLocks(res.locks || []);
+                              setUnbanInput('');
+                              setAdminMsg(
+                                res.removed > 0
+                                  ? `Unbanned "${targetKey}" (${res.removed} record(s) cleared).`
+                                  : `No active lock or failure record found for "${targetKey}".`
+                              );
+                            } catch (err: unknown) {
+                              setAdminMsg(err instanceof Error ? err.message : 'Unban failed');
+                            }
+                          }}
+                          className="flex items-center gap-1.5"
+                        >
+                          <input
+                            type="text"
+                            value={unbanInput}
+                            onChange={(e) => setUnbanInput(e.target.value)}
+                            placeholder="IP or username (e.g. 1.2.3.4 or admin)"
+                            className={`px-3 py-1.5 rounded-lg border font-mono w-56 ${bgInput}`}
+                          />
+                          <button
+                            type="submit"
+                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition"
+                          >
+                            Unban
+                          </button>
+                        </form>
+                        {loginLocks.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                const res = await api.unbanLoginLock('all');
+                                setLoginLocks(res.locks || []);
+                                setAdminMsg(`Cleared all ${res.removed} login lock/tracking records.`);
+                              } catch (err: unknown) {
+                                setAdminMsg(err instanceof Error ? err.message : 'Unban all failed');
+                              }
+                            }}
+                            className={`px-3 py-1.5 rounded-lg border font-semibold transition ${badgeRose}`}
+                          >
+                            Unban All
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {loginLocks.length === 0 ? (
+                      <div className={`p-4 rounded-xl border text-center ${bgSubCard} ${textSecondary}`}>
+                        No locked IPs or accounts. Login brute-force protection is active.
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left font-mono">
+                          <thead>
+                            <tr
+                              className={`border-b border-slate-200 dark:border-slate-800/70 ${textSecondary}`}
+                            >
+                              <th className="py-2 px-2">Type</th>
+                              <th className="py-2 px-2">IP / Account</th>
+                              <th className="py-2 px-2">Failed Attempts</th>
+                              <th className="py-2 px-2">Status</th>
+                              <th className="py-2 px-2">Last Attempt</th>
+                              <th className="py-2 px-2 text-right">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-200 dark:divide-slate-800/60">
+                            {loginLocks.map((entry) => (
+                              <tr key={entry.key}>
+                                <td className="py-2 px-2 uppercase text-sky-700 dark:text-sky-400">
+                                  {entry.type}
+                                </td>
+                                <td className={`py-2 px-2 font-bold ${textPrimary}`}>
+                                  {entry.value}
+                                </td>
+                                <td className={`py-2 px-2 ${textPrimary}`}>
+                                  {entry.failures} / {entry.max_failures}
+                                </td>
+                                <td className="py-2 px-2">
+                                  <span
+                                    className={`px-2 py-0.5 rounded border text-[11px] font-semibold ${
+                                      entry.locked ? badgeRose : badgeAmber
+                                    }`}
+                                  >
+                                    {entry.locked
+                                      ? `LOCKED (${Math.ceil(entry.remaining_seconds / 60)}m / ${entry.remaining_seconds}s)`
+                                      : 'Tracking'}
+                                  </span>
+                                </td>
+                                <td className={`py-2 px-2 ${textSecondary}`}>
+                                  {new Date(entry.last_attempt).toLocaleString()}
+                                </td>
+                                <td className="py-2 px-2 text-right">
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      try {
+                                        const res = await api.unbanLoginLock(entry.key);
+                                        setLoginLocks(res.locks || []);
+                                        setAdminMsg(`Manually unbanned ${entry.key}`);
+                                      } catch (err: unknown) {
+                                        setAdminMsg(
+                                          err instanceof Error ? err.message : 'Unban failed'
+                                        );
+                                      }
+                                    }}
+                                    className={`px-2.5 py-1 rounded-lg border font-sans font-semibold transition ${badgeEmerald}`}
+                                  >
+                                    Unban
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* QUERY & ADMINISTRATIVE AUDIT LOGS */}
+                  <div className={`${bgCard} border rounded-2xl p-6 space-y-4`}>
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <h2 className={`text-base font-bold ${textPrimary}`}>
@@ -2261,458 +2682,6 @@ export const App: React.FC = () => {
                           type="button"
                           disabled={currentPage <= 1}
                           onClick={() => setAuditPage(1)}
-                          className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
-                        >
-                          « First
-                        </button>
-                        <button
-                          type="button"
-                          disabled={currentPage <= 1}
-                          onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
-                          className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
-                        >
-                          ‹ Prev
-                        </button>
-                        <button
-                          type="button"
-                          disabled={currentPage >= totalPages}
-                          onClick={() => setAuditPage((p) => Math.min(totalPages, p + 1))}
-                          className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
-                        >
-                          Next ›
-                        </button>
-                        <button
-                          type="button"
-                          disabled={currentPage >= totalPages}
-                          onClick={() => setAuditPage(totalPages)}
-                          className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
-                        >
-                          Last »
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
-          </section>
-        </div>
-      </div>
-    );
-  }
-
-  // ============================================================================
-  // PORTAL 1: PUBLIC / CUSTOMER BGP LOOKING GLASS PORTAL (/)
-  // - Ultra-Wide Fluid Container (`max-w-[96vw]`) with Slim Margins
-  // - Light / Dark / System Auto Theme Switcher (`☀ Light` | `🌙 Dark` | `💻 Auto`)
-  // - PoP Segmented Tabs ABOVE Query Type Tabs (Hidden automatically if <= 1 PoP)
-  // - ZERO Admin Console / Login Buttons in Public Mode (Admin only via /<admin_path>)
-  // ============================================================================
-  const isAuthRequiredMode = boot.settings.access_mode === 'auth_required';
-  const requiresCustomerLoginGate = isAuthRequiredMode && !boot.current_user;
-  const activePOPObj =
-    activePOPGroups.find((p) => p.id.toLowerCase() === selectedPOP.toLowerCase()) ||
-    activePOPGroups[0];
-  const activePOPDisplay = activePOPObj
-    ? activePOPObj.name !== activePOPObj.id
-      ? `${activePOPObj.name} (${activePOPObj.id})`
-      : activePOPObj.id
-    : boot.settings.datacenter_code;
-
-  return (
-    <div className={`min-h-screen ${bgPage} flex flex-col font-sans transition-colors duration-150`}>
-      {mustChangePasswordGate &&
-        renderPasswordChangeModal(!!boot.current_user?.must_change_password)}
-
-      <header className={`border-b ${bgHeader} backdrop-blur sticky top-0 z-30`}>
-        <div className={`${layoutContainer} py-3.5 flex flex-wrap items-center justify-between gap-4`}>
-          <div className="flex items-center gap-3.5">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center font-bold text-sm text-white shadow-lg shadow-sky-500/20">
-              BGP
-            </div>
-            <div>
-              <div className="flex flex-wrap items-center gap-2.5">
-                <span className={`font-bold text-base tracking-tight ${textPrimary}`}>
-                  {boot.settings.organization_name}
-                </span>
-                <span className={`text-[11px] px-2 py-0.5 rounded-md border font-mono font-semibold ${badgeSky}`}>
-                  AS{boot.settings.primary_asn}
-                </span>
-                <span
-                  className={`text-[11px] px-2 py-0.5 rounded-md border font-mono ${
-                    isDark
-                      ? 'bg-slate-800/90 text-slate-300 border-slate-700/80'
-                      : 'bg-slate-100 text-slate-700 border-slate-300'
-                  }`}
-                >
-                  {activePOPDisplay}
-                </span>
-              </div>
-              <p className={`text-xs ${textSecondary} mt-0.5`}>
-                Carrier-Grade Real-Time BGP Routing Table Looking Glass
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-3 text-xs">
-            {renderThemeSwitcher()}
-
-            {/* Only display account controls when the portal is in auth_required mode */}
-            {isAuthRequiredMode && boot.current_user && (
-              <div
-                className={`flex items-center gap-2.5 border rounded-xl px-3.5 py-1.5 ${bgSubCard}`}
-              >
-                <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                <span className={`font-semibold ${textPrimary}`}>
-                  {boot.current_user.display_name || boot.current_user.username}
-                </span>
-                <button
-                  onClick={() => {
-                    setPwdError('');
-                    setShowChangePwdModal(true);
-                  }}
-                  className={`${textSky} hover:underline ml-1 font-medium`}
-                >
-                  Password
-                </button>
-                <button
-                  onClick={handleLogout}
-                  className={`${textRose} hover:underline ml-1 font-medium`}
-                >
-                  Sign Out
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      </header>
-
-      <main className={`${layoutContainer} py-6 flex-1`}>
-        {requiresCustomerLoginGate ? (
-          <div className={`max-w-md mx-auto mt-12 ${bgCard} border rounded-2xl p-7`}>
-            <h2 className={`text-base font-bold ${textPrimary} mb-1`}>
-              Sign In Required — {boot.settings.organization_name}
-            </h2>
-            <p className={`text-xs ${textSecondary} mb-5`}>
-              Please sign in with your authorized account to query BGP routing tables.
-            </p>
-            {loginError && (
-              <div className={`mb-4 p-3 rounded-lg border text-xs ${badgeRose}`}>
-                {loginError}
-              </div>
-            )}
-            <form onSubmit={(e) => handleLogin(e)} className="space-y-4">
-              <div>
-                <label className={`block text-xs font-medium ${textSecondary} mb-1.5`}>
-                  Username
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  className={`w-full px-3.5 py-2.5 rounded-lg border text-sm ${bgInput} focus:outline-none focus:border-sky-500`}
-                />
-              </div>
-              <div>
-                <label className={`block text-xs font-medium ${textSecondary} mb-1.5`}>
-                  Password
-                </label>
-                <input
-                  type="password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className={`w-full px-3.5 py-2.5 rounded-lg border text-sm ${bgInput} focus:outline-none focus:border-sky-500`}
-                />
-              </div>
-              <button
-                type="submit"
-                className="w-full py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-sm transition shadow-lg shadow-sky-600/20"
-              >
-                Sign In
-              </button>
-            </form>
-          </div>
-        ) : (
-          <div className="space-y-5">
-            {/* UNIFIED QUERY COMMAND PANEL */}
-            <div className={`${bgCard} border rounded-2xl p-5 sm:p-6 space-y-4`}>
-              {/* ROW 1 (OPTIONAL): MULTI-POP SEGMENTED TABS — ONLY SHOWN WHEN 2 OR MORE POPS ARE CONFIGURED */}
-              {activePOPGroups.length > 1 && (
-                <div className={`flex flex-wrap items-center gap-3 pb-3.5 border-b ${borderSubtle}`}>
-                  <span className={`text-sm font-bold min-w-[88px] shrink-0 ${textPrimary}`}>
-                    PoP Node:
-                  </span>
-                  <div
-                    className={`inline-flex flex-wrap p-1 rounded-xl border gap-1 ${
-                      isDark ? 'bg-[#060911] border-slate-800/90' : 'bg-slate-100 border-slate-200'
-                    }`}
-                  >
-                    {activePOPGroups.map((pop) => {
-                      const active = selectedPOP.toLowerCase() === pop.id.toLowerCase();
-                      return (
-                        <button
-                          key={pop.id}
-                          type="button"
-                          onClick={() => {
-                            if (selectedPOP.toLowerCase() !== pop.id.toLowerCase()) {
-                              setSelectedPOP(pop.id);
-                              setQueryType('prefix');
-                              setSelectedViews([]);
-                              setTarget('');
-                              setLookupResult(null);
-                              setLookupError('');
-                            }
-                          }}
-                          className={`px-4 py-2 rounded-lg text-sm font-bold transition flex items-center gap-2 ${
-                            active
-                              ? 'bg-indigo-600 text-white shadow-sm'
-                              : isDark
-                                ? 'text-slate-300 hover:text-white'
-                                : 'text-slate-700 hover:text-slate-950'
-                          }`}
-                        >
-                          <span>{pop.name}</span>
-                          {pop.name !== pop.id && (
-                            <span
-                              className={`text-[11px] font-mono px-1.5 py-0.5 rounded font-medium ${
-                                active
-                                  ? 'bg-white/20 text-white'
-                                  : isDark
-                                    ? 'bg-slate-800 text-slate-300'
-                                    : 'bg-slate-200/90 text-slate-700'
-                              }`}
-                            >
-                              {pop.id}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* ROW 2: QUERY TYPE SEGMENTED TABS */}
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div className="flex flex-wrap items-center gap-3">
-                  <span className={`text-xs font-semibold min-w-[88px] shrink-0 ${textSecondary}`}>
-                    Query Type:
-                  </span>
-                  <div
-                    className={`inline-flex flex-wrap p-1 rounded-xl border gap-1 ${
-                      isDark ? 'bg-[#060911] border-slate-800/90' : 'bg-slate-100 border-slate-200'
-                    }`}
-                  >
-                    {(
-                      [
-                        { id: 'prefix', label: 'IPv4 / IPv6 Prefix' },
-                        { id: 'aspath', label: 'ASN / AS-Path' },
-                        { id: 'community', label: 'BGP Community' },
-                      ] as const
-                    ).map((qt) => (
-                      <button
-                        key={qt.id}
-                        type="button"
-                        onClick={() => {
-                          if (queryType !== qt.id) {
-                            setQueryType(qt.id);
-                            setTarget('');
-                            setLookupResult(null);
-                            setLookupError('');
-                          }
-                        }}
-                        className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${
-                          queryType === qt.id
-                            ? 'bg-sky-600 text-white shadow-sm'
-                            : isDark
-                              ? 'text-slate-400 hover:text-slate-200'
-                              : 'text-slate-600 hover:text-slate-900'
-                        }`}
-                      >
-                        {qt.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {visiblePermittedViews.length > 1 && (
-                  <div className="flex items-center gap-3 text-xs">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedViews(visiblePermittedViews.map((v) => v.id))}
-                      className={`${textSky} hover:underline font-medium`}
-                    >
-                      Select All ({visiblePermittedViews.length})
-                    </button>
-                    <span className={textSecondary}>|</span>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedViews([])}
-                      className={`${textSecondary} hover:underline`}
-                    >
-                      Clear
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* ROUTING INSTANCE / VRF PILLS */}
-              <div>
-                <div className={`text-xs font-medium ${textSecondary} mb-2`}>
-                  Routing Instances / VRF Tables:
-                </div>
-                {visiblePermittedViews.length === 0 ? (
-                  <div className={`p-4 rounded-xl border text-xs ${bgSubCard} ${textSecondary}`}>
-                    {activePOPDisplay
-                      ? `No routing tables / VRFs are currently configured for PoP ${activePOPDisplay}.`
-                      : 'No routing tables are currently assigned or configured.'}
-                  </div>
-                ) : (
-                  <div className="flex flex-wrap gap-2.5">
-                    {visiblePermittedViews.map((view) => {
-                      const checked = selectedViews.includes(view.id);
-                      return (
-                        <button
-                          key={view.id}
-                          type="button"
-                          onClick={() => toggleViewSelection(view.id)}
-                          className={`group flex items-center gap-2.5 px-3.5 py-2 rounded-xl border text-xs transition ${
-                            checked
-                              ? isDark
-                                ? 'bg-sky-500/15 border-sky-500/60 text-white shadow-sm'
-                                : 'bg-sky-50 border-sky-500 text-sky-950 shadow-sm'
-                              : `${bgSubCard} ${textSecondary} hover:opacity-90`
-                          }`}
-                        >
-                          <span
-                            className={`w-3.5 h-3.5 rounded flex items-center justify-center border text-[10px] ${
-                              checked
-                                ? 'bg-sky-600 border-sky-500 text-white font-bold'
-                                : isDark
-                                  ? 'border-slate-500/60 bg-transparent'
-                                  : 'border-slate-400 bg-white'
-                            }`}
-                          >
-                            {checked ? '✓' : ''}
-                          </span>
-                          <span className="font-semibold">{view.name}</span>
-                          <span
-                            className={`text-[10px] font-mono px-1.5 py-0.5 rounded uppercase ${
-                              checked
-                                ? isDark
-                                  ? 'bg-sky-950/80 text-sky-200 border border-sky-500/30'
-                                  : 'bg-sky-100 text-sky-900 border border-sky-200'
-                                : isDark
-                                  ? 'bg-slate-800/90 text-slate-300'
-                                  : 'bg-slate-200/80 text-slate-700'
-                            }`}
-                          >
-                            {view.vrf_name}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* SEARCH BAR */}
-              <form
-                onSubmit={(e) => handleRunLookup(e)}
-                className="flex flex-col sm:flex-row gap-3"
-              >
-                <div className="relative flex-1">
-                  <input
-                    type="text"
-                    value={target}
-                    onChange={(e) => setTarget(e.target.value)}
-                    placeholder={
-                      queryType === 'prefix'
-                        ? 'Enter IPv4/IPv6 address or CIDR prefix (e.g. 202.96.134.133 or 202.96.128.0/18)'
-                        : queryType === 'aspath'
-                          ? 'Enter ASN or AS-Path sequence (e.g. 4134 or 23764 4134)'
-                          : 'Enter BGP Community or Extended Community (e.g. 23764:11100 or 58453:33960)'
-                    }
-                    className={`w-full px-4 py-3 rounded-xl border text-sm font-mono ${bgInput} focus:outline-none focus:border-sky-500 transition`}
-                  />
-                </div>
-                <button
-                  type="submit"
-                  disabled={lookupLoading || visiblePermittedViews.length === 0}
-                  className="px-7 py-3 rounded-xl bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 disabled:opacity-40 text-white font-semibold text-sm transition shadow-lg shadow-sky-500/20 shrink-0"
-                >
-                  {lookupLoading ? 'Querying RIB...' : 'Query Routes'}
-                </button>
-              </form>
-
-              {lookupError && (
-                <div className={`p-3.5 rounded-xl border text-xs font-mono ${badgeRose}`}>
-                  {lookupError}
-                </div>
-              )}
-            </div>
-
-            {/* TERMINAL CLI OUTPUT WINDOWS (PURE CLI OUTPUT ONLY) */}
-            {lookupResult && (
-              <div className="space-y-5">
-                {lookupResult.results.map((viewRes: ViewQueryResult) => (
-                  <div
-                    key={viewRes.view.id}
-                    className={`cli-terminal border rounded-2xl overflow-hidden shadow-xl ${
-                      isDark ? 'bg-[#070a12] border-slate-800/90' : 'bg-slate-900 border-slate-300'
-                    }`}
-                  >
-                    <div
-                      className={`px-5 py-3 border-b flex flex-wrap items-center justify-between gap-3 ${
-                        isDark
-                          ? 'bg-[#0c1220] border-slate-800/90'
-                          : 'bg-slate-800 border-slate-700'
-                      }`}
-                    >
-                      <div className="flex flex-wrap items-center gap-2.5">
-                        <div className="flex items-center gap-1.5 mr-1">
-                          <span className="w-2.5 h-2.5 rounded-full bg-rose-500/80" />
-                          <span className="w-2.5 h-2.5 rounded-full bg-amber-500/80" />
-                          <span className="w-2.5 h-2.5 rounded-full bg-emerald-500/80" />
-                        </div>
-                        <span className="font-bold text-sm text-white">{viewRes.view.name}</span>
-                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/30 font-mono">
-                          {viewRes.view.vrf_name}
-                        </span>
-                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-mono">
-                          Matched: {viewRes.matched_prefix}
-                        </span>
-                        <span className="text-xs text-slate-300 font-mono">
-                          {viewRes.total_paths} {viewRes.total_paths === 1 ? 'Path' : 'Paths'} ·{' '}
-                          {viewRes.query_time_ms}ms
-                        </span>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={() => copyCLIOutput(viewRes.view.id, viewRes.raw_output)}
-                        className="px-3 py-1 rounded-lg bg-slate-950/80 hover:bg-slate-950 text-xs font-mono text-slate-200 border border-slate-700 transition"
-                      >
-                        {copiedViewID === viewRes.view.id ? '✓ Copied' : 'Copy Output'}
-                      </button>
-                    </div>
-
-                    <pre className="cli-terminal p-5 text-xs font-mono text-emerald-300 bg-[#050811] whitespace-pre-wrap break-words leading-6 selection:bg-sky-500/40 selection:text-white">
-                      {viewRes.raw_output}
-                    </pre>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </main>
-    </div>
-  );
-};
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 }
                           className={`px-2.5 py-1 rounded-lg border transition disabled:opacity-40 ${bgSubCard} ${textPrimary}`}
                         >
                           « First
