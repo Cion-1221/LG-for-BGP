@@ -337,3 +337,88 @@ func TestRemoteLGAgentFRRQueryAndProbe(t *testing.T) {
 		t.Fatalf("unexpected remote agent result: %+v", resp.Results)
 	}
 }
+
+func TestFRRJSONParsingTableAndDetailFormats(t *testing.T) {
+	st, _ := store.NewAppStore("memory")
+	defer func() { _ = st.Close() }()
+	cache := security.NewTTLCache()
+	defer cache.Close()
+	eng := NewEngine(st, cache)
+
+	// 1. Real FRR 10.7.1 `show bgp ipv4 unicast regexp _37965_ json` / `community ... json` output:
+	//    Note `"bestpath": true` (JSON bool), top-level `"path"`, and top-level `"peerId"`!
+	tableJSON := `{
+		"vrfId": 0,
+		"vrfName": "default",
+		"tableVersion": 17827814,
+		"routerId": "103.213.4.23",
+		"defaultLocPrf": 100,
+		"localAS": 65000,
+		"routes": {
+			"139.220.199.0/24": [
+				{
+					"valid": true,
+					"bestpath": true,
+					"selectionReason": "First path received",
+					"pathFrom": "external",
+					"prefix": "139.220.199.0",
+					"prefixLen": 24,
+					"network": "139.220.199.0/24",
+					"metric": 0,
+					"locPrf": 100,
+					"weight": 0,
+					"peerId": "103.213.4.1",
+					"path": "7720 10111 4637 7468 37965",
+					"origin": "IGP",
+					"nexthops": [
+						{"ip": "103.213.4.1", "afi": "ipv4", "used": true}
+					]
+				}
+			]
+		}
+	}`
+	var tableResp frrTableJSONResponse
+	if err := json.Unmarshal([]byte(tableJSON), &tableResp); err != nil {
+		t.Fatalf("failed to unmarshal FRR table-scan JSON (bool bestpath): %v", err)
+	}
+	view := models.RouteViewMeta{ID: "intl", Name: "INTL-ROUTING", VRFName: "global"}
+	paths := eng.convertFRRPaths("139.220.199.0/24", "ipv4", "global", view, tableResp.Routes["139.220.199.0/24"])
+	if len(paths) != 1 || !paths[0].Best || paths[0].NextHop != "103.213.4.1" || paths[0].PeerIP != "103.213.4.1" || paths[0].OriginASN != 37965 {
+		t.Fatalf("unexpected converted FRR table path: %+v", paths)
+	}
+
+	// 2. Real FRR `show bgp ipv4 unicast <prefix> json` detail output:
+	//    Note `"bestpath": {"overall": true}` (JSON object), `"aspath": {"string": ...}`, and `"peer": {"peerId": ...}`!
+	detailJSON := `{
+		"prefix": "139.220.199.0/24",
+		"paths": [
+			{
+				"valid": true,
+				"bestpath": {"overall": true},
+				"aspath": {"string": "7720 10111 4637 7468 37965"},
+				"peer": {"peerId": "103.213.4.1"},
+				"nexthops": [{"ip": "103.213.4.1", "afi": "ipv4"}],
+				"community": {"list": ["7720:1000"]}
+			}
+		]
+	}`
+	var detailResp frrPrefixJSONResponse
+	if err := json.Unmarshal([]byte(detailJSON), &detailResp); err != nil {
+		t.Fatalf("failed to unmarshal FRR prefix detail JSON (object bestpath): %v", err)
+	}
+	dPaths := eng.convertFRRPaths(detailResp.Prefix, "ipv4", "global", view, detailResp.Paths)
+	if len(dPaths) != 1 || !dPaths[0].Best || dPaths[0].OriginASN != 37965 || len(dPaths[0].Communities) != 1 {
+		t.Fatalf("unexpected converted FRR detail path: %+v", dPaths)
+	}
+
+	// 3. Verify AS-Path regex builder preserves optional ^ / $ anchors safely
+	if got := buildFRRASPathRegexp("37965"); got != "_37965_" {
+		t.Fatalf("expected _37965_, got %q", got)
+	}
+	if got := buildFRRASPathRegexp("_37965$"); got != "_37965$" {
+		t.Fatalf("expected _37965$, got %q", got)
+	}
+	if got := buildFRRASPathRegexp("^7720 10111"); got != "^7720_10111_" {
+		t.Fatalf("expected ^7720_10111_, got %q", got)
+	}
+}

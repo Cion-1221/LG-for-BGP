@@ -16,10 +16,12 @@ import (
 
 // AgentQueryRequest is the JSON payload sent by lg-server to a remote lg-agent collector.
 type AgentQueryRequest struct {
-	Engine    string               `json:"engine"`     // "bird2" or "frr"
-	QueryType string               `json:"query_type"` // "prefix", "aspath", "community"
-	Target    string               `json:"target"`
-	View      models.RouteViewMeta `json:"view"`
+	Engine       string               `json:"engine"`     // "bird2" or "frr"
+	QueryType    string               `json:"query_type"` // "prefix", "aspath", "community"
+	Target       string               `json:"target"`
+	View         models.RouteViewMeta `json:"view"`
+	RRNodeName   string               `json:"rr_node_name,omitempty"`
+	RRLoopbackIP string               `json:"rr_loopback_ip,omitempty"`
 }
 
 // AgentQueryResponse is returned by lg-agent for POST /agent/v1/query.
@@ -115,10 +117,12 @@ func (e *Engine) queryRemoteAgent(
 	defer cancel()
 
 	payload := AgentQueryRequest{
-		Engine:    engineType,
-		QueryType: queryType,
-		Target:    target,
-		View:      view,
+		Engine:       engineType,
+		QueryType:    queryType,
+		Target:       target,
+		View:         view,
+		RRNodeName:   rrNode.Name,
+		RRLoopbackIP: rrNode.LoopbackIP,
 	}
 	rawBody, err := json.Marshal(payload)
 	if err != nil {

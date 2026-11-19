@@ -192,6 +192,14 @@ func main() {
 			engType = engineMode
 		}
 
+		queryNode := localNode
+		if n := strings.TrimSpace(req.RRNodeName); n != "" {
+			queryNode.Name = n
+		}
+		if ip := strings.TrimSpace(req.RRLoopbackIP); ip != "" {
+			queryNode.LoopbackIP = ip
+		}
+
 		var (
 			paths   []models.BGPRoutePath
 			matched string
@@ -200,9 +208,9 @@ func main() {
 		)
 		switch engType {
 		case "bird2":
-			paths, matched, rawOut, ok = eng.RunLocalBird2Query(r.Context(), localNode, req.View, qType, req.Target)
+			paths, matched, rawOut, ok = eng.RunLocalBird2Query(r.Context(), queryNode, req.View, qType, req.Target)
 		case "frr":
-			paths, matched, rawOut, ok = eng.RunLocalFrrQuery(r.Context(), localNode, req.View, qType, req.Target)
+			paths, matched, rawOut, ok = eng.RunLocalFrrQuery(r.Context(), queryNode, req.View, qType, req.Target)
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)

@@ -511,32 +511,79 @@ func (e *Engine) RunLocalBird2Neighbors(ctx context.Context, rrNode models.RRNod
 //           prefix, aspath (regexp), community, large-community, and Live Neighbors
 // ==============================================================================
 
-type frrPathJSON struct {
-	Bestpath *struct {
+// frrBestpathFlag unmarshals FRR's "bestpath" field in both JSON schemas:
+//   - Table scans (`regexp`, `community`, `large-community`): `"bestpath": true` (JSON bool)
+//   - Single-prefix lookups (`show bgp ... <prefix> json`):   `"bestpath": {"overall": true}` (JSON object)
+type frrBestpathFlag bool
+
+func (f *frrBestpathFlag) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*f = false
+		return nil
+	}
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		*f = frrBestpathFlag(b)
+		return nil
+	}
+	var obj struct {
 		Overall bool `json:"overall"`
-	} `json:"bestpath"`
-	Best   bool   `json:"bestpath_bool"`
-	PathID uint32 `json:"pathId"`
-	Origin string `json:"origin"`
-	Metric uint32 `json:"metric"`
-	LocPrf uint32 `json:"locPrf"`
-	Valid  bool   `json:"valid"`
-	ASPath *struct {
+	}
+	if err := json.Unmarshal(data, &obj); err == nil {
+		*f = frrBestpathFlag(obj.Overall)
+		return nil
+	}
+	*f = false
+	return nil
+}
+
+type frrPathJSON struct {
+	Bestpath     frrBestpathFlag `json:"bestpath"`
+	Best         bool            `json:"bestpath_bool"`
+	PathID       uint32          `json:"pathId"`
+	Origin       string          `json:"origin"`
+	Metric       uint32          `json:"metric"`
+	LocPrf       uint32          `json:"locPrf"`
+	Valid        bool            `json:"valid"`
+	RPKIValid    bool            `json:"rpkiValid"`
+	RPKIInvalid  bool            `json:"rpkiInvalid"`
+	RPKINotFound bool            `json:"rpkiNotFound"`
+	Path         string          `json:"path"`   // Emitted by FRR table scans (`regexp`, `community`, `large-community`)
+	PeerID       string          `json:"peerId"` // Emitted by FRR table scans (`regexp`, `community`, `large-community`)
+	ASPath       *struct {
 		String string `json:"string"`
-	} `json:"aspath"`
+	} `json:"aspath"` // Emitted by FRR single-prefix detail lookup
 	Nexthops []struct {
 		IP  string `json:"ip"`
 		AFI string `json:"afi"`
 	} `json:"nexthops"`
 	Peer *struct {
 		PeerID string `json:"peerId"`
-	} `json:"peer"`
+	} `json:"peer"` // Emitted by FRR single-prefix detail lookup
 	Community *struct {
 		List []string `json:"list"`
 	} `json:"community"`
 	LargeCommunity *struct {
 		List []string `json:"list"`
 	} `json:"largeCommunity"`
+}
+
+func buildFRRASPathRegexp(cleaned string) string {
+	trimmed := strings.TrimSpace(cleaned)
+	asTokens := extractSafeASPathTokens(trimmed)
+	if len(asTokens) == 0 {
+		return ""
+	}
+	prefixAnchor := "_"
+	if strings.HasPrefix(trimmed, "^") {
+		prefixAnchor = "^"
+	}
+	suffixAnchor := "_"
+	if strings.HasSuffix(trimmed, "$") {
+		suffixAnchor = "$"
+	}
+	return prefixAnchor + strings.Join(asTokens, "_") + suffixAnchor
 }
 
 type frrPrefixJSONResponse struct {
@@ -699,11 +746,11 @@ func (e *Engine) RunLocalFrrQuery(
 		if errVal != nil {
 			return nil, "", "", false
 		}
-		asTokens := extractSafeASPathTokens(cleaned)
-		if len(asTokens) == 0 {
+		expr := buildFRRASPathRegexp(cleaned)
+		if expr == "" {
 			return nil, "", "", false
 		}
-		filterClause = fmt.Sprintf("regexp _%s_", strings.Join(asTokens, "_"))
+		filterClause = fmt.Sprintf("regexp %s", expr)
 	case "community":
 		cleaned, errVal := security.ValidateCommunity(target)
 		if errVal != nil {
@@ -773,6 +820,8 @@ func (e *Engine) RunLocalFrrQuery(
 
 		if len(results) > 0 {
 			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("# Node: %s (%s) | Engine: FRR | VRF: %s | Filter: %s\n",
+				rrNode.Name, rrNode.LoopbackIP, vrfName, target))
 			sb.WriteString(fmt.Sprintf("   %-22s %-16s %-6s %-6s %s\n", "Network", "Next Hop", "LocPrf", "MED", "AS_PATH"))
 			for _, line := range rawLines {
 				sb.WriteString(line + "\n")
@@ -798,14 +847,18 @@ func (e *Engine) RunLocalFrrQuery(
 func (e *Engine) convertFRRPaths(prefix, fam, vrfName string, view models.RouteViewMeta, rawPaths []frrPathJSON) []models.BGPRoutePath {
 	results := make([]models.BGPRoutePath, 0, len(rawPaths))
 	for idx, p := range rawPaths {
-		best := (p.Bestpath != nil && p.Bestpath.Overall) || p.Best || idx == 0
+		best := bool(p.Bestpath) || p.Best || (len(rawPaths) == 1 && idx == 0)
 		nh := ""
 		if len(p.Nexthops) > 0 {
 			nh = p.Nexthops[0].IP
 		}
+		asPathStr := strings.TrimSpace(p.Path)
+		if p.ASPath != nil && strings.TrimSpace(p.ASPath.String) != "" {
+			asPathStr = strings.TrimSpace(p.ASPath.String)
+		}
 		var asns []uint32
-		if p.ASPath != nil && p.ASPath.String != "" && p.ASPath.String != "Local" {
-			for _, tok := range strings.Fields(p.ASPath.String) {
+		if asPathStr != "" && !strings.EqualFold(asPathStr, "Local") {
+			for _, tok := range strings.Fields(strings.NewReplacer("{", " ", "}", " ", ",", " ").Replace(asPathStr)) {
 				if n, errConv := strconv.ParseUint(tok, 10, 32); errConv == nil {
 					asns = append(asns, uint32(n))
 				}
@@ -819,8 +872,17 @@ func (e *Engine) convertFRRPaths(prefix, fam, vrfName string, view models.RouteV
 			comms = append(comms, p.LargeCommunity.List...)
 		}
 		peerIP := view.JuniperSourceIPv4
-		if p.Peer != nil && p.Peer.PeerID != "" {
-			peerIP = p.Peer.PeerID
+		if strings.TrimSpace(p.PeerID) != "" {
+			peerIP = strings.TrimSpace(p.PeerID)
+		}
+		if p.Peer != nil && strings.TrimSpace(p.Peer.PeerID) != "" {
+			peerIP = strings.TrimSpace(p.Peer.PeerID)
+		}
+		rpkiStatus := "NotFound"
+		if p.RPKIValid {
+			rpkiStatus = "Valid"
+		} else if p.RPKIInvalid {
+			rpkiStatus = "Invalid"
 		}
 		pathID := p.PathID
 		if pathID == 0 {
@@ -838,7 +900,7 @@ func (e *Engine) convertFRRPaths(prefix, fam, vrfName string, view models.RouteV
 			p.Metric,
 			comms,
 			peerIP,
-			"NotFound",
+			rpkiStatus,
 			"Active",
 			"Selected in FRR RIB",
 		))
