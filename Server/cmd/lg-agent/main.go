@@ -205,9 +205,9 @@ func main() {
 		)
 		switch engType {
 		case "bird2":
-			paths, matched, rawOut, ok = eng.RunLocalBird2Query(r.Context(), queryNode, req.View, qType, req.Target)
+			paths, matched, rawOut, ok = eng.RunLocalBird2QueryWithLimits(r.Context(), queryNode, req.View, qType, req.Target, req.MaxIPv4, req.MaxIPv6)
 		case "frr":
-			paths, matched, rawOut, ok = eng.RunLocalFrrQuery(r.Context(), queryNode, req.View, qType, req.Target)
+			paths, matched, rawOut, ok = eng.RunLocalFrrQueryWithLimits(r.Context(), queryNode, req.View, qType, req.Target, req.MaxIPv4, req.MaxIPv6)
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)

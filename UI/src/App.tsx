@@ -1138,6 +1138,56 @@ export const App: React.FC = () => {
                     </div>
                   </div>
 
+                  {/* DUAL-STACK AS-PATH / COMMUNITY MAX ROUTE LIMITS */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className={`block font-medium mb-1.5 ${textSecondary}`}>
+                        AS-Path / Community Max IPv4 Routes{' '}
+                        <span className={textSky}>(1–5000, default 50)</span>
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={5000}
+                        required
+                        value={boot.settings.max_filter_routes_ipv4 ?? 50}
+                        onChange={(e) =>
+                          setBoot({
+                            ...boot,
+                            settings: {
+                              ...boot.settings,
+                              max_filter_routes_ipv4: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className={`w-full px-3.5 py-2 rounded-lg border font-mono ${bgInput}`}
+                      />
+                    </div>
+                    <div>
+                      <label className={`block font-medium mb-1.5 ${textSecondary}`}>
+                        AS-Path / Community Max IPv6 Routes{' '}
+                        <span className={textSky}>(1–5000, default 50)</span>
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={5000}
+                        required
+                        value={boot.settings.max_filter_routes_ipv6 ?? 50}
+                        onChange={(e) =>
+                          setBoot({
+                            ...boot,
+                            settings: {
+                              ...boot.settings,
+                              max_filter_routes_ipv6: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className={`w-full px-3.5 py-2 rounded-lg border font-mono ${bgInput}`}
+                      />
+                    </div>
+                  </div>
+
                   {/* BRANDING ICONS: BROWSER TAB FAVICON & PUBLIC PORTAL HEADER LOGO */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className={`p-4 rounded-xl border ${bgSubCard} flex items-center gap-4`}>

@@ -620,10 +620,28 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if newSettings.MaxFilterRoutesV4 == 0 {
+			newSettings.MaxFilterRoutesV4 = 50
+		}
+		if newSettings.MaxFilterRoutesV6 == 0 {
+			newSettings.MaxFilterRoutesV6 = 50
+		}
+		if newSettings.MaxFilterRoutesV4 < 1 || newSettings.MaxFilterRoutesV4 > 5000 {
+			writeError(w, http.StatusBadRequest, "max_filter_routes_ipv4 must be between 1 and 5000")
+			return
+		}
+		if newSettings.MaxFilterRoutesV6 < 1 || newSettings.MaxFilterRoutesV6 > 5000 {
+			writeError(w, http.StatusBadRequest, "max_filter_routes_ipv6 must be between 1 and 5000")
+			return
+		}
+		prevSettings := s.store.GetAdminSettings()
 		updated, err := s.store.UpdateSettings(newSettings)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if prevSettings.MaxFilterRoutesV4 != updated.MaxFilterRoutesV4 || prevSettings.MaxFilterRoutesV6 != updated.MaxFilterRoutesV6 {
+			s.cache.Clear()
 		}
 		s.store.AppendAuditLog(models.AuditLogEntry{
 			Username: admin.Username,

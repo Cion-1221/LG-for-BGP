@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS lg_settings (
     default_engine VARCHAR(32) NOT NULL DEFAULT 'gobgp',
     cache_ttl_seconds INT NOT NULL DEFAULT 30,
     rate_limit_per_minute INT NOT NULL DEFAULT 60,
+    max_filter_routes_ipv4 INT NOT NULL DEFAULT 50,
+    max_filter_routes_ipv6 INT NOT NULL DEFAULT 50,
     organization_name VARCHAR(128) NOT NULL DEFAULT 'BGP Looking Glass Portal',
     favicon_icon MEDIUMTEXT NULL,
     portal_logo MEDIUMTEXT NULL,

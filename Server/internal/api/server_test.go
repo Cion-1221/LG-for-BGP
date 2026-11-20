@@ -217,6 +217,8 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 	validPNG := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 	goodSettings := st.GetAdminSettings()
 	goodSettings.OrganizationName = "ASLINE LG Portal"
+	goodSettings.MaxFilterRoutesV4 = 150
+	goodSettings.MaxFilterRoutesV6 = 90
 	goodSettings.FaviconIcon = validPNG
 	goodSettings.PortalLogo = validPNG
 	goodPayload, _ := json.Marshal(goodSettings)
@@ -238,6 +240,18 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 	handler.ServeHTTP(recSetBad, reqSetBad)
 	if recSetBad.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 rejecting malicious SVG icon, got %d: %s", recSetBad.Code, recSetBad.Body.String())
+	}
+
+	// Reject out-of-range max_filter_routes_ipv4 (>5000)
+	badLimit := goodSettings
+	badLimit.MaxFilterRoutesV4 = 99999
+	badLimitPayload, _ := json.Marshal(badLimit)
+	reqBadLimit := httptest.NewRequest(http.MethodPut, "/api/v1/admin/settings", bytes.NewReader(badLimitPayload))
+	reqBadLimit.Header.Set("Authorization", "Bearer "+adminResp.Token)
+	recBadLimit := httptest.NewRecorder()
+	handler.ServeHTTP(recBadLimit, reqBadLimit)
+	if recBadLimit.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting out-of-range max_filter_routes_ipv4, got %d", recBadLimit.Code)
 	}
 
 	// 10. Security verification: Public Portal bootstrap, lookup, and summary MUST NEVER leak RR/Agent IPs or endpoints!

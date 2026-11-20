@@ -186,6 +186,8 @@ type SystemSettings struct {
 	DefaultEngine      string        `json:"default_engine"`
 	CacheTTLSeconds    int           `json:"cache_ttl_seconds"`
 	RateLimitPerMinute int           `json:"rate_limit_per_minute"`
+	MaxFilterRoutesV4  int           `json:"max_filter_routes_ipv4"` // Max IPv4 routes returned for AS-Path / Community queries (default 50, range 1..5000)
+	MaxFilterRoutesV6  int           `json:"max_filter_routes_ipv6"` // Max IPv6 routes returned for AS-Path / Community queries (default 50, range 1..5000)
 	OrganizationName   string        `json:"organization_name"`
 	FaviconIcon        string        `json:"favicon_icon"` // Custom browser tab favicon (base64 Data URL; empty = built-in default)
 	PortalLogo         string        `json:"portal_logo"`  // Custom Public Portal header logo (base64 Data URL; empty = default BGP badge)

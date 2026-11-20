@@ -21,6 +21,8 @@ type AgentQueryRequest struct {
 	Target     string               `json:"target"`
 	View       models.RouteViewMeta `json:"view"`
 	RRNodeName string               `json:"rr_node_name,omitempty"`
+	MaxIPv4    int                  `json:"max_ipv4,omitempty"`
+	MaxIPv6    int                  `json:"max_ipv6,omitempty"`
 }
 
 // AgentQueryResponse is returned by lg-agent for POST /agent/v1/query.
@@ -115,12 +117,15 @@ func (e *Engine) queryRemoteAgent(
 	qctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	maxV4, maxV6 := e.filterRouteLimits()
 	payload := AgentQueryRequest{
 		Engine:     engineType,
 		QueryType:  queryType,
 		Target:     target,
 		View:       view,
 		RRNodeName: rrNode.Name,
+		MaxIPv4:    maxV4,
+		MaxIPv6:    maxV6,
 	}
 	rawBody, err := json.Marshal(payload)
 	if err != nil {
@@ -148,7 +153,7 @@ func (e *Engine) queryRemoteAgent(
 	}
 
 	var out AgentQueryResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&out); err != nil {
 		return nil, "", "", false
 	}
 	if !out.OK {

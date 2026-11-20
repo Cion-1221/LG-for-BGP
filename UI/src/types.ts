@@ -107,6 +107,8 @@ export interface SystemSettings {
   default_engine: string;
   cache_ttl_seconds: number;
   rate_limit_per_minute: number;
+  max_filter_routes_ipv4?: number;
+  max_filter_routes_ipv6?: number;
   organization_name: string;
   favicon_icon?: string;
   portal_logo?: string;

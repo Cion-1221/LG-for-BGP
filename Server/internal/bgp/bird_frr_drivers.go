@@ -19,7 +19,26 @@ import (
 
 var reSafeVRFName = regexp.MustCompile(`^[a-zA-Z0-9_\-]{1,64}$`)
 
-const maxDriverFilterMatches = 50
+const defaultFilterRouteLimit = 50
+const maxFilterRouteLimit = 5000
+
+func clampFilterRouteLimit(v int) int {
+	if v <= 0 {
+		return defaultFilterRouteLimit
+	}
+	if v > maxFilterRouteLimit {
+		return maxFilterRouteLimit
+	}
+	return v
+}
+
+func (e *Engine) filterRouteLimits() (int, int) {
+	if e == nil || e.store == nil {
+		return defaultFilterRouteLimit, defaultFilterRouteLimit
+	}
+	settings := e.store.GetSettings()
+	return clampFilterRouteLimit(settings.MaxFilterRoutesV4), clampFilterRouteLimit(settings.MaxFilterRoutesV6)
+}
 
 func formatDualStackFilterSummary(target string, v4Count, v6Count int) string {
 	switch {
@@ -106,7 +125,7 @@ func (e *Engine) queryLiveBird2VRF(
 	return e.RunLocalBird2Query(ctx, rrNode, view, queryType, target)
 }
 
-// RunLocalBird2Query executes a read-only `birdc -r` query locally (reused by both lg-server and lg-agent).
+// RunLocalBird2Query executes a read-only `birdc -r` query locally using the configured IPv4/IPv6 filter route limits.
 func (e *Engine) RunLocalBird2Query(
 	ctx context.Context,
 	rrNode models.RRNodeConfig,
@@ -114,6 +133,22 @@ func (e *Engine) RunLocalBird2Query(
 	queryType string,
 	target string,
 ) ([]models.BGPRoutePath, string, string, bool) {
+	maxV4, maxV6 := e.filterRouteLimits()
+	return e.RunLocalBird2QueryWithLimits(ctx, rrNode, view, queryType, target, maxV4, maxV6)
+}
+
+// RunLocalBird2QueryWithLimits executes a read-only `birdc -r` query locally with explicit IPv4/IPv6 route caps.
+func (e *Engine) RunLocalBird2QueryWithLimits(
+	ctx context.Context,
+	rrNode models.RRNodeConfig,
+	view models.RouteViewMeta,
+	queryType string,
+	target string,
+	maxV4 int,
+	maxV6 int,
+) ([]models.BGPRoutePath, string, string, bool) {
+	maxV4 = clampFilterRouteLimit(maxV4)
+	maxV6 = clampFilterRouteLimit(maxV6)
 	birdcBin, err := exec.LookPath("birdc")
 	if err != nil {
 		return nil, "", "", false
@@ -227,10 +262,10 @@ func (e *Engine) RunLocalBird2Query(
 				var p4, p6 []models.BGPRoutePath
 				var clip4, clip6 string
 				if ok4 && !strings.Contains(raw4, "Network not in table") {
-					p4, _, clip4 = e.parseBird2Output(raw4, view, target, maxDriverFilterMatches)
+					p4, _, clip4 = e.parseBird2Output(raw4, view, target, maxV4, 0)
 				}
 				if ok6 && !strings.Contains(raw6, "Network not in table") {
-					p6, _, clip6 = e.parseBird2Output(raw6, view, target, maxDriverFilterMatches)
+					p6, _, clip6 = e.parseBird2Output(raw6, view, target, 0, maxV6)
 				}
 				combined := make([]models.BGPRoutePath, 0, len(p4)+len(p6))
 				combined = append(combined, p4...)
@@ -270,11 +305,11 @@ func (e *Engine) RunLocalBird2Query(
 		return []models.BGPRoutePath{}, "No matching route", rawOut, true
 	}
 
-	limit := 0
+	limV4, limV6 := 0, 0
 	if queryType != "prefix" {
-		limit = maxDriverFilterMatches
+		limV4, limV6 = maxV4, maxV6
 	}
-	paths, matched, clippedRaw := e.parseBird2Output(rawOut, view, target, limit)
+	paths, matched, clippedRaw := e.parseBird2Output(rawOut, view, target, limV4, limV6)
 	if len(paths) == 0 {
 		return []models.BGPRoutePath{}, "No matching route", rawOut, true
 	}
@@ -292,7 +327,7 @@ func (e *Engine) RunLocalBird2Query(
 	return paths, matched, clippedRaw, true
 }
 
-func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, target string, maxPerFamily int) ([]models.BGPRoutePath, string, string) {
+func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, target string, maxV4, maxV6 int) ([]models.BGPRoutePath, string, string) {
 	lines := strings.Split(rawOut, "\n")
 	var paths []models.BGPRoutePath
 	var matchedPrefix string
@@ -306,9 +341,8 @@ func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, targ
 
 	flush := func() {
 		if cur != nil {
-			withinLimit := maxPerFamily <= 0 ||
-				(cur.AddressFamily == "ipv6" && v6Count < maxPerFamily) ||
-				(cur.AddressFamily != "ipv6" && v4Count < maxPerFamily)
+			withinLimit := (cur.AddressFamily == "ipv6" && (maxV6 <= 0 || v6Count < maxV6)) ||
+				(cur.AddressFamily != "ipv6" && (maxV4 <= 0 || v4Count < maxV4))
 			if withinLimit {
 				cur.Communities = e.TranslateCommunities(curComms)
 				paths = append(paths, *cur)
@@ -335,7 +369,7 @@ func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, targ
 		isHeader := !strings.HasPrefix(rawLine, "\t") && !strings.HasPrefix(rawLine, " ") && (strings.Contains(line, "unicast") || strings.Contains(line, " ["))
 		if isHeader {
 			flush()
-			if maxPerFamily > 0 && v4Count >= maxPerFamily && v6Count >= maxPerFamily {
+			if (maxV4 > 0 && v4Count >= maxV4) && (maxV6 > 0 && v6Count >= maxV6) {
 				truncated = true
 				break
 			}
@@ -351,7 +385,7 @@ func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, targ
 			if strings.Contains(matchedPrefix, ":") {
 				fam = "ipv6"
 			}
-			if maxPerFamily > 0 && ((fam == "ipv6" && v6Count >= maxPerFamily) || (fam != "ipv6" && v4Count >= maxPerFamily)) {
+			if (fam == "ipv6" && maxV6 > 0 && v6Count >= maxV6) || (fam != "ipv6" && maxV4 > 0 && v4Count >= maxV4) {
 				truncated = true
 				continue
 			}
@@ -423,7 +457,7 @@ func (e *Engine) parseBird2Output(rawOut string, view models.RouteViewMeta, targ
 	}
 	outRaw := rawOut
 	if truncated && len(keptLines) > 0 {
-		outRaw = strings.Join(keptLines, "\n") + fmt.Sprintf("\n# ... truncated after %d matching routes per address family ...\n", maxPerFamily)
+		outRaw = strings.Join(keptLines, "\n") + fmt.Sprintf("\n# ... truncated after configured route limits (IPv4=%d, IPv6=%d) ...\n", maxV4, maxV6)
 	}
 	return paths, matchedPrefix, outRaw
 }
@@ -776,7 +810,7 @@ func frrOutputIsScopeError(out string) bool {
 		strings.Contains(lower, "no bgp instance")
 }
 
-// RunLocalFrrQuery executes read-only `vtysh` commands locally (supports prefix, aspath, community, and VyOS VRFs).
+// RunLocalFrrQuery executes read-only `vtysh` commands locally using configured IPv4/IPv6 filter route limits.
 func (e *Engine) RunLocalFrrQuery(
 	ctx context.Context,
 	rrNode models.RRNodeConfig,
@@ -784,6 +818,22 @@ func (e *Engine) RunLocalFrrQuery(
 	queryType string,
 	target string,
 ) ([]models.BGPRoutePath, string, string, bool) {
+	maxV4, maxV6 := e.filterRouteLimits()
+	return e.RunLocalFrrQueryWithLimits(ctx, rrNode, view, queryType, target, maxV4, maxV6)
+}
+
+// RunLocalFrrQueryWithLimits executes read-only `vtysh` commands locally with explicit IPv4/IPv6 route caps.
+func (e *Engine) RunLocalFrrQueryWithLimits(
+	ctx context.Context,
+	rrNode models.RRNodeConfig,
+	view models.RouteViewMeta,
+	queryType string,
+	target string,
+	maxV4 int,
+	maxV6 int,
+) ([]models.BGPRoutePath, string, string, bool) {
+	maxV4 = clampFilterRouteLimit(maxV4)
+	maxV6 = clampFilterRouteLimit(maxV6)
 	vtyshBin, err := exec.LookPath("vtysh")
 	if err != nil {
 		return nil, "", "", false
@@ -891,7 +941,7 @@ func (e *Engine) RunLocalFrrQuery(
 			r6 afScanRes
 		)
 
-		scanAF := func(afStr string, out *afScanRes) {
+		scanAF := func(afStr string, maxRoutes int, out *afScanRes) {
 			vtyCmdJSON := fmt.Sprintf("show bgp %s%s unicast %s json", clause, afStr, filterClause)
 			jsonBytes, err := runVtysh(cctx, vtyshBin, vtyBaseArgs, vtyCmdJSON)
 			if err != nil {
@@ -915,12 +965,12 @@ func (e *Engine) RunLocalFrrQuery(
 			sort.Strings(prefixes)
 
 			for _, pfx := range prefixes {
-				if len(out.paths) >= maxDriverFilterMatches {
+				if len(out.paths) >= maxRoutes {
 					break
 				}
 				converted := e.convertFRRPaths(pfx, afStr, vrfName, view, tableResp.Routes[pfx])
 				for _, rp := range converted {
-					if len(out.paths) >= maxDriverFilterMatches {
+					if len(out.paths) >= maxRoutes {
 						break
 					}
 					out.paths = append(out.paths, rp)
@@ -943,11 +993,11 @@ func (e *Engine) RunLocalFrrQuery(
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			scanAF("ipv4", &r4)
+			scanAF("ipv4", maxV4, &r4)
 		}()
 		go func() {
 			defer wg.Done()
-			scanAF("ipv6", &r6)
+			scanAF("ipv6", maxV6, &r6)
 		}()
 		wg.Wait()
 

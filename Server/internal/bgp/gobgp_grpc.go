@@ -199,12 +199,18 @@ func (e *Engine) queryLiveGoBGPgRPC(
 		return nil, "", "", false
 	}
 
+	maxV4, maxV6 := e.filterRouteLimits()
+
 	// Helper to run a ListPath query with given AFI, family label, RD, and lookup type
 	runLookup := func(targetAFI apipb.Family_Afi, famLabel string, tableType apipb.TableType, tableName string, safi apipb.Family_Safi, rd string, lType apipb.TableLookupPrefix_Type) ([]models.BGPRoutePath, string, string, bool) {
 		var prefixes []*apipb.TableLookupPrefix
 		batchSize := uint64(0)
 		sortType := apipb.ListPathRequest_PREFIX
 		onlyBinary := false
+		maxMatches := maxV4
+		if famLabel == "ipv6" {
+			maxMatches = maxV6
+		}
 
 		if queryType == "prefix" && lookupCIDR != "" {
 			prefixes = []*apipb.TableLookupPrefix{
@@ -233,7 +239,7 @@ func (e *Engine) queryLiveGoBGPgRPC(
 			BatchSize:        batchSize,
 			EnableOnlyBinary: onlyBinary,
 		}
-		return e.fetchPathsFromStream(cctx, client, req, rrNode, view, famLabel, queryType, target, rd)
+		return e.fetchPathsFromStream(cctx, client, req, rrNode, view, famLabel, queryType, target, rd, maxMatches)
 	}
 
 	// Dual-stack concurrent filter scan (IPv4 + IPv6 independently capped at 50 routes each)
@@ -547,6 +553,7 @@ func (e *Engine) fetchPathsFromStream(
 	queryType string,
 	target string,
 	rd string,
+	maxFilterMatches int,
 ) ([]models.BGPRoutePath, string, string, bool) {
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
@@ -558,9 +565,9 @@ func (e *Engine) fetchPathsFromStream(
 
 	showLabel := req.GetFamily().GetSafi() == apipb.Family_SAFI_MPLS_VPN
 
-	// Mode A: Stream-filter on-the-fly for AS-Path or Community queries (stops immediately once 50 matching paths are found)
+	// Mode A: Stream-filter on-the-fly for AS-Path or Community queries (stops immediately once maxFilterMatches paths are found)
 	if queryType == "aspath" || queryType == "community" {
-		const maxFilterMatches = 50
+		maxFilterMatches = clampFilterRouteLimit(maxFilterMatches)
 		var results []models.BGPRoutePath
 		var rawLines []string
 		pathSeq := uint32(1)

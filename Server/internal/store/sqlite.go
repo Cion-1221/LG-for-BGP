@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS lg_settings (
     default_engine TEXT NOT NULL DEFAULT 'gobgp',
     cache_ttl_seconds INTEGER NOT NULL DEFAULT 30,
     rate_limit_per_minute INTEGER NOT NULL DEFAULT 60,
+    max_filter_routes_ipv4 INTEGER NOT NULL DEFAULT 50,
+    max_filter_routes_ipv6 INTEGER NOT NULL DEFAULT 50,
     organization_name TEXT NOT NULL DEFAULT 'BGP Looking Glass Portal',
     favicon_icon TEXT NOT NULL DEFAULT '',
     portal_logo TEXT NOT NULL DEFAULT '',
@@ -219,6 +221,8 @@ func (s *AppStore) initSQLite(rawDSN string) error {
 	_, _ = s.db.Exec("ALTER TABLE lg_rr_nodes ADD COLUMN agent_token TEXT NOT NULL DEFAULT ''")
 	_, _ = s.db.Exec("ALTER TABLE lg_settings ADD COLUMN favicon_icon TEXT NOT NULL DEFAULT ''")
 	_, _ = s.db.Exec("ALTER TABLE lg_settings ADD COLUMN portal_logo TEXT NOT NULL DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE lg_settings ADD COLUMN max_filter_routes_ipv4 INTEGER NOT NULL DEFAULT 50")
+	_, _ = s.db.Exec("ALTER TABLE lg_settings ADD COLUMN max_filter_routes_ipv6 INTEGER NOT NULL DEFAULT 50")
 
 	var count int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM lg_settings").Scan(&count); err != nil {
@@ -256,9 +260,10 @@ func (s *AppStore) syncAllToSQLiteLocked() error {
 	_, err = tx.Exec(`
 		INSERT INTO lg_settings (
 			id, access_mode, admin_secret_slug, public_allowed_views, default_rr_node,
-			default_engine, cache_ttl_seconds, rate_limit_per_minute, organization_name,
+			default_engine, cache_ttl_seconds, rate_limit_per_minute,
+			max_filter_routes_ipv4, max_filter_routes_ipv6, organization_name,
 			favicon_icon, portal_logo, primary_asn, datacenter_code, allow_raw_output, updated_at
-		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			access_mode=excluded.access_mode,
 			admin_secret_slug=excluded.admin_secret_slug,
@@ -267,6 +272,8 @@ func (s *AppStore) syncAllToSQLiteLocked() error {
 			default_engine=excluded.default_engine,
 			cache_ttl_seconds=excluded.cache_ttl_seconds,
 			rate_limit_per_minute=excluded.rate_limit_per_minute,
+			max_filter_routes_ipv4=excluded.max_filter_routes_ipv4,
+			max_filter_routes_ipv6=excluded.max_filter_routes_ipv6,
 			organization_name=excluded.organization_name,
 			favicon_icon=excluded.favicon_icon,
 			portal_logo=excluded.portal_logo,
@@ -282,6 +289,8 @@ func (s *AppStore) syncAllToSQLiteLocked() error {
 		s.data.Settings.DefaultEngine,
 		s.data.Settings.CacheTTLSeconds,
 		s.data.Settings.RateLimitPerMinute,
+		normalizeFilterRouteLimit(s.data.Settings.MaxFilterRoutesV4),
+		normalizeFilterRouteLimit(s.data.Settings.MaxFilterRoutesV6),
 		s.data.Settings.OrganizationName,
 		s.data.Settings.FaviconIcon,
 		s.data.Settings.PortalLogo,
@@ -417,8 +426,9 @@ func (s *AppStore) loadFromSQLiteLocked() error {
 	var updatedAtRaw string
 	err := s.db.QueryRow(`
 		SELECT access_mode, admin_secret_slug, public_allowed_views, default_rr_node,
-		       default_engine, cache_ttl_seconds, rate_limit_per_minute, organization_name,
-		       COALESCE(favicon_icon, ''), COALESCE(portal_logo, ''),
+		       default_engine, cache_ttl_seconds, rate_limit_per_minute,
+		       COALESCE(max_filter_routes_ipv4, 50), COALESCE(max_filter_routes_ipv6, 50),
+		       organization_name, COALESCE(favicon_icon, ''), COALESCE(portal_logo, ''),
 		       primary_asn, datacenter_code, allow_raw_output, updated_at
 		FROM lg_settings WHERE id = 1
 	`).Scan(
@@ -429,6 +439,8 @@ func (s *AppStore) loadFromSQLiteLocked() error {
 		&s.data.Settings.DefaultEngine,
 		&s.data.Settings.CacheTTLSeconds,
 		&s.data.Settings.RateLimitPerMinute,
+		&s.data.Settings.MaxFilterRoutesV4,
+		&s.data.Settings.MaxFilterRoutesV6,
 		&s.data.Settings.OrganizationName,
 		&s.data.Settings.FaviconIcon,
 		&s.data.Settings.PortalLogo,

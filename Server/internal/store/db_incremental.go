@@ -44,9 +44,10 @@ func (s *AppStore) upsertSettingsDBLocked() error {
 		query = `
 			INSERT INTO lg_settings (
 				id, access_mode, admin_secret_slug, public_allowed_views, default_rr_node,
-				default_engine, cache_ttl_seconds, rate_limit_per_minute, organization_name,
+				default_engine, cache_ttl_seconds, rate_limit_per_minute,
+				max_filter_routes_ipv4, max_filter_routes_ipv6, organization_name,
 				favicon_icon, portal_logo, primary_asn, datacenter_code, allow_raw_output, updated_at
-			) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				access_mode=excluded.access_mode,
 				admin_secret_slug=excluded.admin_secret_slug,
@@ -55,6 +56,8 @@ func (s *AppStore) upsertSettingsDBLocked() error {
 				default_engine=excluded.default_engine,
 				cache_ttl_seconds=excluded.cache_ttl_seconds,
 				rate_limit_per_minute=excluded.rate_limit_per_minute,
+				max_filter_routes_ipv4=excluded.max_filter_routes_ipv4,
+				max_filter_routes_ipv6=excluded.max_filter_routes_ipv6,
 				organization_name=excluded.organization_name,
 				favicon_icon=excluded.favicon_icon,
 				portal_logo=excluded.portal_logo,
@@ -67,9 +70,10 @@ func (s *AppStore) upsertSettingsDBLocked() error {
 		query = `
 			INSERT INTO lg_settings (
 				id, access_mode, admin_secret_slug, public_allowed_views, default_rr_node,
-				default_engine, cache_ttl_seconds, rate_limit_per_minute, organization_name,
+				default_engine, cache_ttl_seconds, rate_limit_per_minute,
+				max_filter_routes_ipv4, max_filter_routes_ipv6, organization_name,
 				favicon_icon, portal_logo, primary_asn, datacenter_code, allow_raw_output, updated_at
-			) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
 				access_mode=VALUES(access_mode),
 				admin_secret_slug=VALUES(admin_secret_slug),
@@ -78,6 +82,8 @@ func (s *AppStore) upsertSettingsDBLocked() error {
 				default_engine=VALUES(default_engine),
 				cache_ttl_seconds=VALUES(cache_ttl_seconds),
 				rate_limit_per_minute=VALUES(rate_limit_per_minute),
+				max_filter_routes_ipv4=VALUES(max_filter_routes_ipv4),
+				max_filter_routes_ipv6=VALUES(max_filter_routes_ipv6),
 				organization_name=VALUES(organization_name),
 				favicon_icon=VALUES(favicon_icon),
 				portal_logo=VALUES(portal_logo),
@@ -95,6 +101,8 @@ func (s *AppStore) upsertSettingsDBLocked() error {
 		s.data.Settings.DefaultEngine,
 		s.data.Settings.CacheTTLSeconds,
 		s.data.Settings.RateLimitPerMinute,
+		s.data.Settings.MaxFilterRoutesV4,
+		s.data.Settings.MaxFilterRoutesV6,
 		s.data.Settings.OrganizationName,
 		s.data.Settings.FaviconIcon,
 		s.data.Settings.PortalLogo,

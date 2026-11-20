@@ -203,4 +203,16 @@ func TestGoBGPgRPCVPNv4VrfLookup(t *testing.T) {
 	if commPaths[0].AddressFamily != "ipv4" || commPaths[1].AddressFamily != "ipv6" {
 		t.Fatalf("expected IPv4 + IPv6 paths in Community lookup, got %s and %s", commPaths[0].AddressFamily, commPaths[1].AddressFamily)
 	}
+
+	// Verify dynamic IPv4/IPv6 filter route limits from settings (default 50/50 -> custom 200/100)
+	if v4, v6 := eng.filterRouteLimits(); v4 != 50 || v6 != 50 {
+		t.Fatalf("expected default filter route limits 50/50, got %d/%d", v4, v6)
+	}
+	curSettings := st.GetAdminSettings()
+	curSettings.MaxFilterRoutesV4 = 200
+	curSettings.MaxFilterRoutesV6 = 100
+	_, _ = st.UpdateSettings(curSettings)
+	if v4, v6 := eng.filterRouteLimits(); v4 != 200 || v6 != 100 {
+		t.Fatalf("expected updated filter route limits 200/100, got %d/%d", v4, v6)
+	}
 }

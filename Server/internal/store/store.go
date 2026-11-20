@@ -260,6 +260,8 @@ func defaultInitialData() PersistentData {
 			DefaultEngine:      "gobgp",
 			CacheTTLSeconds:    30,
 			RateLimitPerMinute: 60,
+			MaxFilterRoutesV4:  50,
+			MaxFilterRoutesV6:  50,
 			OrganizationName:   "BGP Looking Glass Portal",
 			PrimaryASN:         65000,
 			DatacenterCode:     "CORE-POP-01",
@@ -328,12 +330,24 @@ func (s *AppStore) persistFileLocked() error {
 	return os.WriteFile(s.filePath, raw, 0600)
 }
 
+func normalizeFilterRouteLimit(v int) int {
+	if v <= 0 {
+		return 50
+	}
+	if v > 5000 {
+		return 5000
+	}
+	return v
+}
+
 // GetPublicSettings returns SystemSettings with AdminSecretSlug stripped out so public visitors cannot see it.
 func (s *AppStore) GetPublicSettings() models.SystemSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	cp := s.data.Settings
 	cp.AdminSecretSlug = ""
+	cp.MaxFilterRoutesV4 = normalizeFilterRouteLimit(cp.MaxFilterRoutesV4)
+	cp.MaxFilterRoutesV6 = normalizeFilterRouteLimit(cp.MaxFilterRoutesV6)
 	return cp
 }
 
@@ -342,6 +356,8 @@ func (s *AppStore) GetAdminSettings() models.SystemSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	cp := s.data.Settings
+	cp.MaxFilterRoutesV4 = normalizeFilterRouteLimit(cp.MaxFilterRoutesV4)
+	cp.MaxFilterRoutesV6 = normalizeFilterRouteLimit(cp.MaxFilterRoutesV6)
 	if s.configuredAdminSlug != "" {
 		cp.AdminSecretSlug = s.configuredAdminSlug
 	} else if envSlug := strings.Trim(os.Getenv("LG_ADMIN_SECRET_SLUG"), "/"); envSlug != "" {
@@ -388,6 +404,8 @@ func (s *AppStore) UpdateSettings(newSettings models.SystemSettings) (models.Sys
 	} else if newSettings.AdminSecretSlug == "" {
 		newSettings.AdminSecretSlug = s.data.Settings.AdminSecretSlug
 	}
+	newSettings.MaxFilterRoutesV4 = normalizeFilterRouteLimit(newSettings.MaxFilterRoutesV4)
+	newSettings.MaxFilterRoutesV6 = normalizeFilterRouteLimit(newSettings.MaxFilterRoutesV6)
 	s.data.Settings = newSettings
 	err := s.upsertSettingsDBLocked()
 	return s.data.Settings, err
