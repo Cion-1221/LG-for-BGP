@@ -16,8 +16,8 @@ CREATE DATABASE IF NOT EXISTS lg_for_bgp
 
 CREATE USER IF NOT EXISTS 'lg_user'@'127.0.0.1' IDENTIFIED BY 'ChangeMe_StrongDBPass_2026!';
 CREATE USER IF NOT EXISTS 'lg_user'@'localhost' IDENTIFIED BY 'ChangeMe_StrongDBPass_2026!';
-GRANT ALL PRIVILEGES ON lg_for_bgp.* TO 'lg_user'@'127.0.0.1';
-GRANT ALL PRIVILEGES ON lg_for_bgp.* TO 'lg_user'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, INDEX, ALTER ON lg_for_bgp.* TO 'lg_user'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, INDEX, ALTER ON lg_for_bgp.* TO 'lg_user'@'localhost';
 FLUSH PRIVILEGES;
 
 USE lg_for_bgp;
@@ -48,8 +48,9 @@ CREATE TABLE IF NOT EXISTS lg_vrfs (
     vrf_name VARCHAR(128) NOT NULL,
     type VARCHAR(32) NOT NULL DEFAULT 'auto',
     pop VARCHAR(64) NOT NULL DEFAULT 'all',
-    rr_node_ids JSON NOT NULL,
+    rr_node_ids JSON NULL,
     juniper_source_ipv4 VARCHAR(64) NOT NULL DEFAULT '',
+    bird_table_v6 VARCHAR(128) NOT NULL DEFAULT '',
     description TEXT NOT NULL,
     sort_order INT NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

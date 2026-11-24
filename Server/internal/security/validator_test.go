@@ -20,6 +20,9 @@ func TestPreventCommandInjectionPayloads(t *testing.T) {
 		"8.8.8.8\r\nrequest system reboot",
 		"65001; id",
 		"65000:1001; id",
+		"2914$ 4134",
+		"2914 ^4134",
+		"AS0",
 	}
 
 	for _, payload := range maliciousPayloads {
@@ -35,7 +38,7 @@ func TestPreventCommandInjectionPayloads(t *testing.T) {
 	}
 }
 
-func TestValidInputs(t *testing.T) {
+func TestValidInputsAndASPathAnchors(t *testing.T) {
 	if norm, fam, isPfx, err := ValidatePrefixOrIP("8.8.8.8"); err != nil || norm != "8.8.8.8" || fam != "ipv4" || isPfx {
 		t.Fatalf("Unexpected result for 8.8.8.8: %v, %s, %s", err, norm, fam)
 	}
@@ -44,6 +47,9 @@ func TestValidInputs(t *testing.T) {
 	}
 	if asn, err := ValidateASPathOrASN("AS2914"); err != nil || asn != "2914" {
 		t.Fatalf("Unexpected result for AS2914: %v, %s", err, asn)
+	}
+	if anchored, err := ValidateASPathOrASN("^AS23764 AS4134$"); err != nil || anchored != "^23764 4134$" {
+		t.Fatalf("Expected anchored AS-Path '^23764 4134$', got %q (err=%v)", anchored, err)
 	}
 	if comm, err := ValidateCommunity("65000:65000:100"); err != nil || comm != "65000:65000:100" {
 		t.Fatalf("Unexpected result for Large Community: %v, %s", err, comm)

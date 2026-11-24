@@ -4,7 +4,6 @@ package bgp
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,37 +16,6 @@ import (
 )
 
 const maxConcurrentFullTableScansPerPOP = 3
-
-var wellKnownASNs = map[uint32]struct {
-	Name string
-	Tier string
-}{
-	2914:   {"NTT Global IP Network", "tier1"},
-	3491:   {"PCCW Global", "tier1"},
-	4637:   {"Telstra Global", "tier1"},
-	3356:   {"Lumen (Level3)", "tier1"},
-	174:    {"Cogent Communications", "tier1"},
-	1299:   {"Arelion (Telia Carrier)", "tier1"},
-	6939:   {"Hurricane Electric (HE)", "tier1"},
-	6453:   {"TATA Communications", "tier1"},
-	4809:   {"China Telecom Next Carrying Network (CN2)", "cn_carrier"},
-	4134:   {"Chinanet Backbone", "cn_carrier"},
-	4812:   {"China Telecom Regional Network", "cn_carrier"},
-	23764:  {"China Telecom Global (CTGNet)", "cn_carrier"},
-	58453:  {"China Mobile International (CMI)", "cn_carrier"},
-	9808:   {"China Mobile Backbone", "cn_carrier"},
-	22427:  {"China Mobile International Peer", "cn_carrier"},
-	10099:  {"China Unicom Global (CUG)", "cn_carrier"},
-	4837:   {"China Unicom 169 Backbone", "cn_carrier"},
-	15169:  {"Google LLC", "customer"},
-	13335:  {"Cloudflare, Inc.", "customer"},
-	8075:   {"Microsoft Corporation", "customer"},
-	16509:  {"Amazon.com (AWS)", "customer"},
-	32934:  {"Meta Platforms", "customer"},
-	20940:  {"Akamai International", "customer"},
-	45102:  {"Alibaba Cloud", "customer"},
-	132203: {"Tencent Cloud", "customer"},
-}
 
 type Engine struct {
 	store    *store.AppStore
@@ -80,43 +48,14 @@ func (e *Engine) getScanSemaphore(popKey string) chan struct{} {
 	return sem
 }
 
-func (e *Engine) ResolveASN(asn uint32) models.ASHop {
-	if info, ok := wellKnownASNs[asn]; ok {
-		return models.ASHop{
-			ASN:  asn,
-			Name: info.Name,
-			Tier: info.Tier,
-		}
-	}
-	return models.ASHop{
-		ASN:  asn,
-		Name: fmt.Sprintf("AS%d", asn),
-		Tier: "customer",
-	}
-}
-
-func (e *Engine) TranslateCommunities(rawList []string) []models.CommunityItem {
-	out := make([]models.CommunityItem, 0, len(rawList))
-	for _, raw := range rawList {
-		out = append(out, models.CommunityItem{
-			Raw:      raw,
-			Label:    raw,
-			Category: "community",
-		})
-	}
-	return out
-}
-
 func isScopedPOP(pop string) bool {
 	p := strings.TrimSpace(pop)
 	return p != "" && !strings.EqualFold(p, "all") && !strings.EqualFold(p, "auto") && !strings.EqualFold(p, "multi") && !strings.EqualFold(p, "none")
 }
 
 // ViewAllowsRR reports whether the given RouteViewMeta is bound to the given RR node.
-// A VRF can bind to 1 RR, multiple RRs, or all RRs (RRNodeIDs = ["all"]).
 func ViewAllowsRR(view models.RouteViewMeta, rr models.RRNodeConfig) bool {
 	if len(view.RRNodeIDs) == 0 {
-		// Unbound VRF or legacy PoP-scoped fallback
 		if strings.EqualFold(strings.TrimSpace(view.POP), "none") {
 			return false
 		}
@@ -157,8 +96,7 @@ func ViewBelongsToPOP(view models.RouteViewMeta, targetPOP string, rrNodes []mod
 }
 
 // selectCandidateRRNodes returns an ordered slice of enabled RR nodes strictly within the requested PoP
-// AND bound to the given RouteView (when view != nil).
-// It NEVER falls back to RR nodes in other PoPs or unbound RR nodes.
+// AND bound to the given RouteView (when view != nil). Never falls back across PoP boundaries.
 func (e *Engine) selectCandidateRRNodes(requestedID string, requestedPOP string, view *models.RouteViewMeta, requestedEngine string) ([]models.RRNodeConfig, error) {
 	nodes := e.store.GetRRNodes()
 	var enabledNodes []models.RRNodeConfig
@@ -168,10 +106,9 @@ func (e *Engine) selectCandidateRRNodes(requestedID string, requestedPOP string,
 		}
 	}
 	if len(enabledNodes) == 0 {
-		return nil, fmt.Errorf("no active Route Reflector (RR) node is configured or enabled; please configure at least 1 RR node in the Web Admin Console (Section 3: PoP Groups & RR Nodes)")
+		return nil, fmt.Errorf("no active Route Reflector (RR) node is configured or enabled; please configure at least 1 RR node in the Web Admin Console (Section 2: PoP Groups & RR Nodes)")
 	}
 
-	// 1. Strictly filter by requested PoP first — NEVER cross PoP boundaries!
 	popFilter := strings.TrimSpace(requestedPOP)
 	hasPOPFilter := isScopedPOP(popFilter)
 	pool := enabledNodes
@@ -188,7 +125,6 @@ func (e *Engine) selectCandidateRRNodes(requestedID string, requestedPOP string,
 		pool = popNodes
 	}
 
-	// 2. Strictly filter by VRF <-> RR bindings (if view is specified)
 	if view != nil {
 		var boundNodes []models.RRNodeConfig
 		for _, n := range pool {
@@ -205,7 +141,6 @@ func (e *Engine) selectCandidateRRNodes(requestedID string, requestedPOP string,
 		pool = boundNodes
 	}
 
-	// 3. Explicit RR node ID check within strictly filtered pool
 	reqID := strings.TrimSpace(requestedID)
 	if reqID != "" && !strings.EqualFold(reqID, "auto") {
 		for _, n := range pool {
@@ -223,7 +158,7 @@ func (e *Engine) selectCandidateRRNodes(requestedID string, requestedPOP string,
 	var candidates []models.RRNodeConfig
 	added := make(map[string]bool)
 
-	addMatching := func(matchEngine bool, primaryOnly bool) {
+	addMatching := func(matchEngine bool, primaryOnly bool, healthyOnly bool) {
 		for _, n := range pool {
 			if added[n.ID] {
 				continue
@@ -236,16 +171,23 @@ func (e *Engine) selectCandidateRRNodes(requestedID string, requestedPOP string,
 			if primaryOnly && !isPrimary {
 				continue
 			}
+			if healthyOnly && !n.Healthy {
+				continue
+			}
 			candidates = append(candidates, n)
 			added[n.ID] = true
 		}
 	}
 
-	// Priority strictly inside this PoP & VRF's bound RRs: Primary -> Backup
-	addMatching(true, true)
-	addMatching(true, false)
-	addMatching(false, true)
-	addMatching(false, false)
+	// Prefer healthy Primary -> healthy Backup -> any Primary -> any Backup strictly inside this PoP & VRF
+	addMatching(true, true, true)
+	addMatching(true, false, true)
+	addMatching(true, true, false)
+	addMatching(true, false, false)
+	addMatching(false, true, true)
+	addMatching(false, false, true)
+	addMatching(false, true, false)
+	addMatching(false, false, false)
 
 	return candidates, nil
 }
@@ -294,7 +236,6 @@ func (e *Engine) ExecuteLookup(ctx context.Context, req models.LookupRequest) (*
 		go func(i int, vm models.RouteViewMeta) {
 			defer wg.Done()
 
-			// Enforce strict PoP + VRF->RR binding
 			targetPOP := reqPOP
 			if !hasReqPOP && isScopedPOP(vm.POP) {
 				targetPOP = strings.TrimSpace(vm.POP)
@@ -312,7 +253,6 @@ func (e *Engine) ExecuteLookup(ctx context.Context, req models.LookupRequest) (*
 					QueryTarget: req.Target,
 					MatchedNet:  "No Active RR in PoP",
 					TotalPaths:  0,
-					Paths:       []models.BGPRoutePath{},
 					RawOutput:   fmt.Sprintf("# Error: %s\n", errMsg),
 					QueryTimeMs: 1,
 				}
@@ -338,14 +278,11 @@ func (e *Engine) ExecuteLookup(ctx context.Context, req models.LookupRequest) (*
 				return
 			}
 
-			// Singleflight deduplicates concurrent identical queries to protect the RR
 			sfVal, _, _ := e.sfGroup.Do(cacheKey, func() (interface{}, error) {
-				// Re-check cache after entering singleflight
 				if cachedRes, hit := e.cache.Get(cacheKey); hit {
 					return cachedRes, nil
 				}
 
-				// Concurrency gate for expensive full-table scans (aspath / community) per PoP
 				if isFullTableScan {
 					semKey := targetPOP
 					if semKey == "" {
@@ -366,7 +303,6 @@ func (e *Engine) ExecuteLookup(ctx context.Context, req models.LookupRequest) (*
 							QueryTarget: req.Target,
 							MatchedNet:  "Scan Concurrency Limit",
 							TotalPaths:  0,
-							Paths:       []models.BGPRoutePath{},
 							RawOutput:   fmt.Sprintf("# Busy: PoP %s full-table scan concurrency limit (%d) reached; please retry in a few seconds.\n", semKey, maxConcurrentFullTableScansPerPOP),
 							QueryTimeMs: 1,
 						}, nil
@@ -380,7 +316,6 @@ func (e *Engine) ExecuteLookup(ctx context.Context, req models.LookupRequest) (*
 							QueryTarget: req.Target,
 							MatchedNet:  "Request Cancelled",
 							TotalPaths:  0,
-							Paths:       []models.BGPRoutePath{},
 							RawOutput:   "# Request cancelled by client.\n",
 							QueryTimeMs: 1,
 						}, nil
@@ -430,8 +365,6 @@ func (e *Engine) ExecuteLookup(ctx context.Context, req models.LookupRequest) (*
 	}, nil
 }
 
-// querySingleViewWithFailover queries 1 or multiple bound RR nodes strictly within the same PoP (Primary -> Backup).
-// Each RR is queried using that RR's own configured EngineType (unless reqEngine overrides it explicitly).
 func (e *Engine) querySingleViewWithFailover(
 	ctx context.Context,
 	candidates []models.RRNodeConfig,
@@ -454,7 +387,7 @@ func (e *Engine) querySingleViewWithFailover(
 
 		switch activeEngine {
 		case "gobgp":
-			if livePaths, matchedNet, rawOut, ok := e.queryLiveGoBGPgRPC(ctx, rrNode, view, queryType, target); ok {
+			if totalPaths, matchedNet, rawOut, ok := e.queryLiveGoBGPgRPC(ctx, rrNode, view, queryType, target); ok {
 				return models.ViewQueryResult{
 					View:        view,
 					RRNodeID:    rrNode.ID,
@@ -462,13 +395,12 @@ func (e *Engine) querySingleViewWithFailover(
 					EngineType:  "gobgp",
 					QueryTarget: target,
 					MatchedNet:  matchedNet,
-					TotalPaths:  len(livePaths),
-					Paths:       livePaths,
+					TotalPaths:  totalPaths,
 					RawOutput:   rawOut,
 				}
 			}
 		case "bird2":
-			if livePaths, matchedNet, rawOut, ok := e.queryLiveBird2VRF(ctx, rrNode, view, queryType, target); ok {
+			if totalPaths, matchedNet, rawOut, ok := e.queryLiveBird2VRF(ctx, rrNode, view, queryType, target); ok {
 				return models.ViewQueryResult{
 					View:        view,
 					RRNodeID:    rrNode.ID,
@@ -476,13 +408,12 @@ func (e *Engine) querySingleViewWithFailover(
 					EngineType:  "bird2",
 					QueryTarget: target,
 					MatchedNet:  matchedNet,
-					TotalPaths:  len(livePaths),
-					Paths:       livePaths,
+					TotalPaths:  totalPaths,
 					RawOutput:   rawOut,
 				}
 			}
 		case "frr":
-			if livePaths, matchedNet, rawOut, ok := e.queryLiveFrrVRF(ctx, rrNode, view, queryType, target); ok {
+			if totalPaths, matchedNet, rawOut, ok := e.queryLiveFrrVRF(ctx, rrNode, view, queryType, target); ok {
 				return models.ViewQueryResult{
 					View:        view,
 					RRNodeID:    rrNode.ID,
@@ -490,8 +421,7 @@ func (e *Engine) querySingleViewWithFailover(
 					EngineType:  "frr",
 					QueryTarget: target,
 					MatchedNet:  matchedNet,
-					TotalPaths:  len(livePaths),
-					Paths:       livePaths,
+					TotalPaths:  totalPaths,
 					RawOutput:   rawOut,
 				}
 			}
@@ -511,72 +441,14 @@ func (e *Engine) querySingleViewWithFailover(
 		QueryTarget: target,
 		MatchedNet:  "RR Connection Failed",
 		TotalPaths:  0,
-		Paths:       []models.BGPRoutePath{},
 		RawOutput:   errRaw,
 	}
 }
 
-func (e *Engine) buildPath(
-	id uint32,
-	prefix string,
-	family string,
-	best bool,
-	nextHop string,
-	nextHopISP string,
-	asns []uint32,
-	localPref uint32,
-	med uint32,
-	comms []string,
-	peerIP string,
-	rpki string,
-	age string,
-	note string,
-) models.BGPRoutePath {
-	hops := make([]models.ASHop, 0, len(asns))
-	strParts := make([]string, 0, len(asns))
-	for _, asn := range asns {
-		hops = append(hops, e.ResolveASN(asn))
-		strParts = append(strParts, strconv.FormatUint(uint64(asn), 10))
-	}
-	var originASN uint32
-	var originName string
-	if len(hops) > 0 {
-		last := hops[len(hops)-1]
-		originASN = last.ASN
-		originName = last.Name
-	}
-	return models.BGPRoutePath{
-		PathID:         id,
-		Prefix:         prefix,
-		AddressFamily:  family,
-		Best:           best,
-		NextHop:        nextHop,
-		NextHopISP:     nextHopISP,
-		ASPath:         hops,
-		ASPathString:   strings.Join(strParts, " "),
-		Origin:         "IGP",
-		LocalPref:      localPref,
-		MED:            med,
-		Communities:    e.TranslateCommunities(comms),
-		ExtCommunities: []string{},
-		PeerIP:         peerIP,
-		OriginASN:      originASN,
-		OriginName:     originName,
-		RPKIStatus:     rpki,
-		Age:            age,
-		ValidationNote: note,
-	}
-}
-
-// GetNeighborSummary queries EVERY enabled RR node (GoBGP gRPC, BIRD 2, and FRR — local or remote lg-agent)
-// strictly for the VRFs bound to that RR node. Each row identifies its PoP, RR Node, Engine, Route View, and VRF,
-// so multiple RRs sharing the same VRF name are displayed distinctly and accurately, and VRFs with no BGP peer
-// honestly report "No Peer / Idle" instead of borrowing another VRF's peer data.
 func (e *Engine) GetNeighborSummary() []models.BGPNeighborSummary {
 	views := e.store.GetRouteViews()
 	rrNodes := e.store.GetRRNodes()
 
-	// Group bound views per enabled RR so each RR is queried ONCE in parallel
 	type rrJob struct {
 		node  models.RRNodeConfig
 		views []models.RouteViewMeta
@@ -626,7 +498,6 @@ func (e *Engine) GetNeighborSummary() []models.BGPNeighborSummary {
 				return
 			}
 
-			// RR node unreachable -> emit explicit RR Unreachable rows for each VRF bound to this RR
 			offline := make([]models.BGPNeighborSummary, 0, len(j.views))
 			for _, v := range j.views {
 				offline = append(offline, models.BGPNeighborSummary{
@@ -653,7 +524,6 @@ func (e *Engine) GetNeighborSummary() []models.BGPNeighborSummary {
 		summaries = append(summaries, list...)
 	}
 
-	// Include any configured VRFs that currently have 0 active bound RRs so admin can spot misconfigurations
 	for _, v := range views {
 		if !boundViewHasRR[v.ID] {
 			summaries = append(summaries, models.BGPNeighborSummary{

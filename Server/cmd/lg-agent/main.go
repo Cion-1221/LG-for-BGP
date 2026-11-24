@@ -3,10 +3,7 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
-	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -23,10 +20,12 @@ import (
 )
 
 func main() {
-	listenAddr := flag.String("listen", "0.0.0.0:9090", "HTTP listen address for lg-agent (bind to private/tunnel IP in production)")
+	listenAddr := flag.String("listen", "0.0.0.0:9090", "HTTP(S) listen address for lg-agent (bind to private/tunnel IP in production)")
 	engineFlag := flag.String("engine", "auto", "Local BGP daemon engine: bird2, frr, or auto")
 	socketFlag := flag.String("socket", "local", "Local control socket path (e.g. /run/bird/bird.ctl for bird2, /run/frr for frr, or local)")
 	tokenFlag := flag.String("token", "", "Shared Bearer authentication token (can also be set via LG_AGENT_TOKEN)")
+	tlsCertFlag := flag.String("tls-cert", "", "Optional TLS server certificate path for native HTTPS")
+	tlsKeyFlag := flag.String("tls-key", "", "Optional TLS server private key path for native HTTPS")
 	flag.Parse()
 
 	token := strings.TrimSpace(*tokenFlag)
@@ -57,215 +56,23 @@ func main() {
 	defer cache.Close()
 	eng := bgp.NewEngine(st, cache)
 
-	localNode := models.RRNodeConfig{
-		ID:         "local-agent",
-		Name:       "lg-agent",
-		EngineType: engineMode,
-		Endpoint:   strings.TrimSpace(*socketFlag),
-		Enabled:    true,
+	agentSrv := &agentServer{
+		eng:        eng,
+		engineMode: engineMode,
+		socketPath: strings.TrimSpace(*socketFlag),
+		token:      token,
+		localNode: models.RRNodeConfig{
+			ID:         "local-agent",
+			Name:       "lg-agent",
+			EngineType: engineMode,
+			Endpoint:   strings.TrimSpace(*socketFlag),
+			Enabled:    true,
+		},
 	}
-
-	checkAuth := func(w http.ResponseWriter, r *http.Request) bool {
-		if token == "" {
-			return true
-		}
-		auth := strings.TrimSpace(r.Header.Get("Authorization"))
-		got := ""
-		if strings.HasPrefix(auth, "Bearer ") {
-			got = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized agent token"})
-			return false
-		}
-		return true
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/agent/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		if !checkAuth(w, r) {
-			return
-		}
-		status := "ok"
-		msg := ""
-		sock := strings.TrimSpace(*socketFlag)
-		switch engineMode {
-		case "bird2":
-			if _, err := exec.LookPath("birdc"); err != nil {
-				status = "error"
-				msg = fmt.Sprintf("birdc not found in PATH: %v", err)
-			} else if sock != "" && !strings.EqualFold(sock, "local") {
-				if _, err := os.Stat(sock); err != nil {
-					status = "error"
-					msg = fmt.Sprintf("BIRD 2 socket %s not found: %v", sock, err)
-				} else {
-					msg = fmt.Sprintf("BIRD 2 agent ready (socket %s)", sock)
-				}
-			} else {
-				msg = "BIRD 2 agent ready (birdc default socket)"
-			}
-		case "frr":
-			if _, err := exec.LookPath("vtysh"); err != nil {
-				status = "error"
-				msg = fmt.Sprintf("vtysh not found in PATH: %v", err)
-			} else if sock != "" && !strings.EqualFold(sock, "local") {
-				if _, err := os.Stat(sock); err != nil {
-					status = "error"
-					msg = fmt.Sprintf("FRR socket directory %s not found: %v", sock, err)
-				} else {
-					msg = fmt.Sprintf("FRR agent ready (vty_socket %s)", sock)
-				}
-			} else {
-				msg = "FRR agent ready (vtysh default socket)"
-			}
-		default:
-			status = "error"
-			msg = fmt.Sprintf("unsupported engine %q", engineMode)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(bgp.AgentHealthResponse{
-			Status:  status,
-			Engine:  engineMode,
-			Socket:  sock,
-			Message: msg,
-		})
-	})
-
-	mux.HandleFunc("/agent/v1/query", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !checkAuth(w, r) {
-			return
-		}
-		var req bgp.AgentQueryRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(bgp.AgentQueryResponse{OK: false, Error: "invalid JSON payload"})
-			return
-		}
-
-		// Re-validate untrusted query arguments inside the agent boundary (defense-in-depth)
-		qType := strings.ToLower(strings.TrimSpace(req.QueryType))
-		switch qType {
-		case "prefix":
-			norm, _, _, err := security.ValidatePrefixOrIP(req.Target)
-			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadRequest)
-				_ = json.NewEncoder(w).Encode(bgp.AgentQueryResponse{OK: false, Error: err.Error()})
-				return
-			}
-			req.Target = norm
-		case "aspath":
-			cleaned, err := security.ValidateASPathOrASN(req.Target)
-			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadRequest)
-				_ = json.NewEncoder(w).Encode(bgp.AgentQueryResponse{OK: false, Error: err.Error()})
-				return
-			}
-			req.Target = cleaned
-		case "community":
-			cleaned, err := security.ValidateCommunity(req.Target)
-			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadRequest)
-				_ = json.NewEncoder(w).Encode(bgp.AgentQueryResponse{OK: false, Error: err.Error()})
-				return
-			}
-			req.Target = cleaned
-		default:
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(bgp.AgentQueryResponse{OK: false, Error: "unsupported query_type"})
-			return
-		}
-
-		engType := strings.ToLower(strings.TrimSpace(req.Engine))
-		if engType == "" || engType == "auto" {
-			engType = engineMode
-		}
-
-		queryNode := localNode
-		if n := strings.TrimSpace(req.RRNodeName); n != "" {
-			queryNode.Name = n
-		}
-
-		var (
-			paths   []models.BGPRoutePath
-			matched string
-			rawOut  string
-			ok      bool
-		)
-		switch engType {
-		case "bird2":
-			paths, matched, rawOut, ok = eng.RunLocalBird2QueryWithLimits(r.Context(), queryNode, req.View, qType, req.Target, req.MaxIPv4, req.MaxIPv6)
-		case "frr":
-			paths, matched, rawOut, ok = eng.RunLocalFrrQueryWithLimits(r.Context(), queryNode, req.View, qType, req.Target, req.MaxIPv4, req.MaxIPv6)
-		default:
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(bgp.AgentQueryResponse{OK: false, Error: "unsupported engine"})
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(bgp.AgentQueryResponse{
-			OK:            ok,
-			MatchedPrefix: matched,
-			Paths:         paths,
-			RawOutput:     rawOut,
-		})
-	})
-
-	mux.HandleFunc("/agent/v1/neighbors", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !checkAuth(w, r) {
-			return
-		}
-		var req bgp.AgentNeighborsRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(bgp.AgentNeighborsResponse{OK: false, Error: "invalid JSON payload"})
-			return
-		}
-
-		engType := strings.ToLower(strings.TrimSpace(req.Engine))
-		if engType == "" || engType == "auto" {
-			engType = engineMode
-		}
-
-		var (
-			neighbors []models.BGPNeighborSummary
-			ok        bool
-		)
-		switch engType {
-		case "bird2":
-			neighbors, ok = eng.RunLocalBird2Neighbors(r.Context(), localNode, req.Views)
-		case "frr":
-			neighbors, ok = eng.RunLocalFrrNeighbors(r.Context(), localNode, req.Views)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(bgp.AgentNeighborsResponse{
-			OK:        ok,
-			Neighbors: neighbors,
-		})
-	})
 
 	srv := &http.Server{
 		Addr:         *listenAddr,
-		Handler:      mux,
+		Handler:      agentSrv.Handler(),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 35 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -274,15 +81,27 @@ func main() {
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	useTLS := strings.TrimSpace(*tlsCertFlag) != "" && strings.TrimSpace(*tlsKeyFlag) != ""
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+
 	go func() {
 		log.Println("================================================================================")
 		log.Println("  LG-for-BGP Lightweight Remote Collector Agent (lg-agent)")
-		log.Printf("  Listen Address : http://%s", *listenAddr)
+		log.Printf("  Listen Address : %s://%s", scheme, *listenAddr)
 		log.Printf("  BGP Engine     : %s (socket: %s)", engineMode, *socketFlag)
-		log.Printf("  Bearer Auth    : %v", token != "")
+		log.Printf("  Bearer Auth    : %v | Native TLS: %v", token != "", useTLS)
 		log.Println("================================================================================")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[FATAL] lg-agent HTTP server error: %v", err)
+		var serveErr error
+		if useTLS {
+			serveErr = srv.ListenAndServeTLS(*tlsCertFlag, *tlsKeyFlag)
+		} else {
+			serveErr = srv.ListenAndServe()
+		}
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Fatalf("[FATAL] lg-agent HTTP server error: %v", serveErr)
 		}
 	}()
 

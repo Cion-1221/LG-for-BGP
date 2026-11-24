@@ -42,7 +42,7 @@ jwt:
   refresh_token_days: 3
 
 log:
-  dir: "./logs"
+  dir: "/var/log/lg-for-bgp"
   filename: "lg-server"
   max_age_days: 14
   max_backups: 14

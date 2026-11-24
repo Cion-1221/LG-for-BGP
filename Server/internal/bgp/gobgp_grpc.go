@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,143 +13,23 @@ import (
 	apipb "github.com/osrg/gobgp/v3/api"
 	"github.com/osrg/gobgp/v3/pkg/apiutil"
 	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"lg-for-bgp/internal/models"
 	"lg-for-bgp/internal/security"
 )
 
-type grpcConnPool struct {
-	mu    sync.Mutex
-	conns map[string]*grpc.ClientConn
-}
-
-var defaultPool = &grpcConnPool{
-	conns: make(map[string]*grpc.ClientConn),
-}
-
-func (p *grpcConnPool) setConn(endpoint string, conn *grpc.ClientConn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.conns[endpoint] = conn
-}
-
-func (p *grpcConnPool) closeEndpoint(endpoint string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if conn, ok := p.conns[endpoint]; ok {
-		_ = conn.Close()
-		delete(p.conns, endpoint)
-	}
-}
-
-func (p *grpcConnPool) closeAll() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for k, conn := range p.conns {
-		_ = conn.Close()
-		delete(p.conns, k)
-	}
-}
-
-// CloseGRPCConnection closes and removes a cached gRPC connection when an RR node is updated or deleted.
-func CloseGRPCConnection(endpoint string) {
-	defaultPool.closeEndpoint(strings.TrimSpace(endpoint))
-}
-
-// CloseAllGRPCConnections closes all pooled gRPC client connections during graceful shutdown.
-func CloseAllGRPCConnections() {
-	defaultPool.closeAll()
-}
-
-func (p *grpcConnPool) getClient(endpoint string) (apipb.GobgpApiClient, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if conn, ok := p.conns[endpoint]; ok {
-		return apipb.NewGobgpApiClient(conn), nil
-	}
-
-	targetURI := endpoint
-	if !strings.Contains(targetURI, "://") {
-		targetURI = "passthrough:///" + targetURI
-	}
-	conn, err := grpc.NewClient(
-		targetURI,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64*1024*1024)),
-	)
-	if err != nil {
-		return nil, err
-	}
-	p.conns[endpoint] = conn
-	return apipb.NewGobgpApiClient(conn), nil
-}
-
-// resolveGoBGPVrfRD queries GoBGP's ListVrf gRPC API to resolve a VRF name (e.g. "VRF-CN-OPTIMIZE")
-// to its Route Distinguisher string (e.g. "18013:1").
-// Also returns true if the GoBGP gRPC server responded (proving the gRPC connection is live).
-func (e *Engine) resolveGoBGPVrfRD(ctx context.Context, client apipb.GobgpApiClient, vrfName string) (string, bool) {
-	stream, err := client.ListVrf(ctx, &apipb.ListVrfRequest{})
-	if err != nil {
-		return "", false
-	}
-
-	var firstVrfRD string
-	vrfCount := 0
-	for {
-		r, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", false
-		}
-		v := r.GetVrf()
-		if v == nil {
-			continue
-		}
-		rdObj, errRD := apiutil.UnmarshalRD(v.GetRd())
-		if errRD != nil || rdObj == nil {
-			continue
-		}
-		rdStr := rdObj.String()
-		vrfCount++
-		if firstVrfRD == "" {
-			firstVrfRD = rdStr
-		}
-		if strings.EqualFold(strings.TrimSpace(v.GetName()), strings.TrimSpace(vrfName)) || strings.EqualFold(rdStr, strings.TrimSpace(vrfName)) {
-			return rdStr, true
-		}
-	}
-
-	// If the user entered an RD directly (e.g. "18013:1"), validate and return it
-	if !isGlobalRIB(vrfName) {
-		if _, err := bgp.ParseRouteDistinguisher(vrfName); err == nil {
-			return vrfName, true
-		}
-	}
-
-	// If VRF name was set to "global" but the RR only has 1 VRF configured, return empty RD here
-	// (caller can fall back to firstVrfRD if global unicast table is empty).
-	return "", true
-}
-
-// queryLiveGoBGPgRPC queries GoBGP directly over native gRPC (ListVrf + ListPath RPC) without any CLI command execution.
-// When a VRF is configured (e.g. VRF-CN-OPTIMIZE with RD 18013:1), GoBGP stores VRF routes in the global
-// VPNv4/VPNv6 table (`SAFI_MPLS_VPN`) indexed by RD. Querying `TableType_GLOBAL` with `SAFI_MPLS_VPN`, `Rd`,
-// and `TableLookupPrefix_SHORTER` performs an O(1) radix/hash lookup (identical to `gobgp global rib <ip>/32 rd <rd> shorter-prefixes -a vpnv4`).
+// queryLiveGoBGPgRPC queries GoBGP directly over native gRPC (ListVrf + ListPath RPC) without CLI execution.
+// Enforces strict VRF isolation: when a specific VRF is requested, it NEVER falls back to the Global Unicast RIB.
 func (e *Engine) queryLiveGoBGPgRPC(
 	ctx context.Context,
 	rrNode models.RRNodeConfig,
 	view models.RouteViewMeta,
 	queryType string,
 	target string,
-) ([]models.BGPRoutePath, string, string, bool) {
+) (int, string, string, bool) {
 	client, err := defaultPool.getClient(rrNode.Endpoint)
 	if err != nil {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
 
 	timeout := 5 * time.Second
@@ -167,42 +46,40 @@ func (e *Engine) queryLiveGoBGPgRPC(
 	if queryType == "prefix" {
 		normalized, fam, isPrefix, errVal := security.ValidatePrefixOrIP(target)
 		if errVal != nil {
-			return nil, "", "", false
+			return 0, "", "", false
 		}
 		familyStr = fam
 		isExactPrefix = isPrefix
 		if isPrefix {
 			lookupCIDR = normalized
+		} else if fam == "ipv6" {
+			lookupCIDR = normalized + "/128"
 		} else {
-			if fam == "ipv6" {
-				lookupCIDR = normalized + "/128"
-			} else {
-				lookupCIDR = normalized + "/32"
-			}
+			lookupCIDR = normalized + "/32"
 		}
 	} else if strings.Contains(target, ":") && strings.Count(target, ":") > 2 {
 		familyStr = "ipv6"
 	}
 
 	afi := apipb.Family_AFI_IP
-	neighborIP := view.JuniperSourceIPv4
+	neighborIP := strings.TrimSpace(view.JuniperSourceIPv4)
 	if familyStr == "ipv6" {
 		afi = apipb.Family_AFI_IP6
-		if view.JuniperSourceIPv6 != "" {
-			neighborIP = view.JuniperSourceIPv6
+		if strings.TrimSpace(view.JuniperSourceIPv6) != "" {
+			neighborIP = strings.TrimSpace(view.JuniperSourceIPv6)
 		}
 	}
 
 	vrfName := resolveVRFName(view)
-	rdStr, grpcAlive := e.resolveGoBGPVrfRD(cctx, client, vrfName)
+	wantGlobal := isGlobalRIB(vrfName)
+	rdStr, grpcAlive := e.resolveGoBGPVrfRD(cctx, client, rrNode.Endpoint, vrfName)
 	if !grpcAlive {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
 
 	maxV4, maxV6 := e.filterRouteLimits()
 
-	// Helper to run a ListPath query with given AFI, family label, RD, and lookup type
-	runLookup := func(targetAFI apipb.Family_Afi, famLabel string, tableType apipb.TableType, tableName string, safi apipb.Family_Safi, rd string, lType apipb.TableLookupPrefix_Type) ([]models.BGPRoutePath, string, string, bool) {
+	runLookup := func(targetAFI apipb.Family_Afi, famLabel string, tableType apipb.TableType, tableName string, safi apipb.Family_Safi, rd string, lType apipb.TableLookupPrefix_Type) (int, string, string, bool) {
 		var prefixes []*apipb.TableLookupPrefix
 		batchSize := uint64(0)
 		sortType := apipb.ListPathRequest_PREFIX
@@ -221,8 +98,6 @@ func (e *Engine) queryLiveGoBGPgRPC(
 				},
 			}
 		} else {
-			// For AS-Path or Community scans, stream in small batches with EnableOnlyBinary=true
-			// so GoBGP skips expensive protobuf Any reflection on all 1.62M routes.
 			batchSize = 64
 			sortType = apipb.ListPathRequest_NONE
 			onlyBinary = true
@@ -239,16 +114,14 @@ func (e *Engine) queryLiveGoBGPgRPC(
 			BatchSize:        batchSize,
 			EnableOnlyBinary: onlyBinary,
 		}
-		return e.fetchPathsFromStream(cctx, client, req, rrNode, view, famLabel, queryType, target, rd, maxMatches)
+		return e.fetchPathsFromStream(cctx, client, req, famLabel, queryType, target, rd, maxMatches)
 	}
 
-	// Dual-stack concurrent filter scan (IPv4 + IPv6 independently capped at 50 routes each)
-	// used by AS-Path and BGP Community queries so IPv4 never starves IPv6.
-	runDualStackFilter := func(safi apipb.Family_Safi, rd string) ([]models.BGPRoutePath, string, string, bool) {
+	runDualStackFilter := func(safi apipb.Family_Safi, rd string) (int, string, string, bool) {
 		var (
 			wg      sync.WaitGroup
-			v4Paths []models.BGPRoutePath
-			v6Paths []models.BGPRoutePath
+			v4Count int
+			v6Count int
 			v4Raw   string
 			v6Raw   string
 			v4OK    bool
@@ -257,91 +130,131 @@ func (e *Engine) queryLiveGoBGPgRPC(
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			v4Paths, _, v4Raw, v4OK = runLookup(apipb.Family_AFI_IP, "ipv4", apipb.TableType_GLOBAL, "", safi, rd, apipb.TableLookupPrefix_SHORTER)
+			v4Count, _, v4Raw, v4OK = runLookup(apipb.Family_AFI_IP, "ipv4", apipb.TableType_GLOBAL, "", safi, rd, apipb.TableLookupPrefix_SHORTER)
 		}()
 		go func() {
 			defer wg.Done()
-			v6Paths, _, v6Raw, v6OK = runLookup(apipb.Family_AFI_IP6, "ipv6", apipb.TableType_GLOBAL, "", safi, rd, apipb.TableLookupPrefix_SHORTER)
+			v6Count, _, v6Raw, v6OK = runLookup(apipb.Family_AFI_IP6, "ipv6", apipb.TableType_GLOBAL, "", safi, rd, apipb.TableLookupPrefix_SHORTER)
 		}()
 		wg.Wait()
 
 		if !v4OK && !v6OK {
-			return nil, "", "", false
+			return 0, "", "", false
 		}
-		combined := make([]models.BGPRoutePath, 0, len(v4Paths)+len(v6Paths))
-		combined = append(combined, v4Paths...)
-		combined = append(combined, v6Paths...)
-		if len(combined) == 0 {
+		total := v4Count + v6Count
+		if total == 0 {
 			emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table.\n",
 				rrNode.Name, vrfName, target)
-			return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
+			return 0, "No matching route", emptyRaw, true
 		}
 
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("# Node: %s | Engine: GOBGP | VRF: %s | Filter: %s\n",
 			rrNode.Name, vrfName, target))
-		if len(v4Paths) > 0 {
-			sb.WriteString(fmt.Sprintf("\n--- IPv4 Routes (%d matched) ---\n", len(v4Paths)))
+		if v4Count > 0 {
+			sb.WriteString(fmt.Sprintf("\n--- IPv4 Routes (%d matched) ---\n", v4Count))
 			sb.WriteString(v4Raw)
 		}
-		if len(v6Paths) > 0 {
-			sb.WriteString(fmt.Sprintf("\n--- IPv6 Routes (%d matched) ---\n", len(v6Paths)))
+		if v6Count > 0 {
+			sb.WriteString(fmt.Sprintf("\n--- IPv6 Routes (%d matched) ---\n", v6Count))
 			sb.WriteString(v6Raw)
 		}
-		summaryLabel := formatDualStackFilterSummary(target, len(v4Paths), len(v6Paths))
-		return combined, summaryLabel, sb.String(), true
+		return total, formatDualStackFilterSummary(target, v4Count, v6Count), sb.String(), true
 	}
 
-	// Case 1: VRF Mode (VRF has an RD in GoBGP, e.g. VRF-CN-OPTIMIZE -> RD 18013:1)
-	// Equivalent to: `gobgp global rib <ip>/32 rd <rd> shorter-prefixes -a vpnv4` (or vpnv6)
-	if rdStr != "" {
-		if queryType != "prefix" {
-			if paths, matched, rawOut, ok := runDualStackFilter(apipb.Family_SAFI_MPLS_VPN, rdStr); ok {
-				return paths, matched, rawOut, true
+	// Case 1: Dedicated Multi-VRF Mode (`!wantGlobal`) — STRICT VRF ISOLATION (never falls back to Global Unicast RIB!)
+	if !wantGlobal {
+		if rdStr != "" {
+			if queryType != "prefix" {
+				count, matched, rawOut, ok := runDualStackFilter(apipb.Family_SAFI_MPLS_VPN, rdStr)
+				if !ok {
+					InvalidateVRFRDCache()
+					return 0, "", "", false
+				}
+				return count, matched, rawOut, true
 			}
-		} else {
+			rpcAlive := false
 			if isExactPrefix {
-				if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_MPLS_VPN, rdStr, apipb.TableLookupPrefix_EXACT); ok && len(paths) > 0 {
-					return paths, matched, rawOut, true
+				count, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_MPLS_VPN, rdStr, apipb.TableLookupPrefix_EXACT)
+				if ok {
+					rpcAlive = true
+					if count > 0 {
+						return count, matched, rawOut, true
+					}
 				}
 			}
-			if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_MPLS_VPN, rdStr, apipb.TableLookupPrefix_SHORTER); ok && len(paths) > 0 {
-				return paths, matched, rawOut, true
-			}
-		}
-	}
-
-	// Case 2: Single Global Unicast RIB (`vrf_name` is empty / "global" or VRF has no VPN RD)
-	// Equivalent to: `gobgp global rib <ip>/32 shorter-prefixes -a ipv4` (or ipv6)
-	if isGlobalRIB(vrfName) || rdStr == "" {
-		if queryType != "prefix" {
-			if paths, matched, rawOut, ok := runDualStackFilter(apipb.Family_SAFI_UNICAST, ""); ok {
-				return paths, matched, rawOut, true
-			}
-		} else {
-			if isExactPrefix {
-				if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_EXACT); ok && len(paths) > 0 {
-					return paths, matched, rawOut, true
+			count, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_MPLS_VPN, rdStr, apipb.TableLookupPrefix_SHORTER)
+			if ok {
+				rpcAlive = true
+				if count > 0 {
+					return count, matched, rawOut, true
 				}
 			}
-			if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER); ok && len(paths) > 0 {
-				return paths, matched, rawOut, true
+			if !rpcAlive {
+				InvalidateVRFRDCache()
+				return 0, "", "", false
+			}
+			emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s (RD %s) | Target: %s\nNetwork not in table.\n",
+				rrNode.Name, vrfName, rdStr, target)
+			return 0, "No matching route", emptyRaw, true
+		}
+
+		// VRF has no MPLS VPN RD on this GoBGP collector: only check dedicated VRF neighbor Adj-RIB-In if explicitly configured
+		if queryType == "prefix" && neighborIP != "" {
+			count, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_ADJ_IN, neighborIP, apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER)
+			if !ok {
+				return 0, "", "", false
+			}
+			if count > 0 {
+				return count, matched, rawOut, true
+			}
+		}
+
+		emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table (VRF %s has no matching routes on this RR).\n",
+			rrNode.Name, vrfName, target, vrfName)
+		return 0, "No matching route", emptyRaw, true
+	}
+
+	// Case 2: Single Global Unicast RIB (`wantGlobal == true`)
+	if queryType != "prefix" {
+		return runDualStackFilter(apipb.Family_SAFI_UNICAST, "")
+	}
+
+	rpcAlive := false
+	if isExactPrefix {
+		count, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_EXACT)
+		if ok {
+			rpcAlive = true
+			if count > 0 {
+				return count, matched, rawOut, true
+			}
+		}
+	}
+	count, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_GLOBAL, "", apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER)
+	if ok {
+		rpcAlive = true
+		if count > 0 {
+			return count, matched, rawOut, true
+		}
+	}
+
+	if neighborIP != "" {
+		adjCount, adjMatched, adjRaw, adjOK := runLookup(afi, familyStr, apipb.TableType_ADJ_IN, neighborIP, apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER)
+		if adjOK {
+			rpcAlive = true
+			if adjCount > 0 {
+				return adjCount, adjMatched, adjRaw, true
 			}
 		}
 	}
 
-	// Case 3: Neighbor Adj-RIB-In fallback (`gobgp neighbor <ip> adj-in <ip>/32 shorter-prefixes`)
-	if queryType == "prefix" && neighborIP != "" {
-		if paths, matched, rawOut, ok := runLookup(afi, familyStr, apipb.TableType_ADJ_IN, neighborIP, apipb.Family_SAFI_UNICAST, "", apipb.TableLookupPrefix_SHORTER); ok && len(paths) > 0 {
-			return paths, matched, rawOut, true
-		}
+	if !rpcAlive {
+		return 0, "", "", false
 	}
 
-	// The gRPC server is reachable and alive, but no route matched in the RIB.
-	// Return an empty live result (`ok = true` with 0 paths) so we NEVER fall back to fake mock routes!
 	emptyRaw := fmt.Sprintf("# Node: %s | Engine: GOBGP\n# VRF: %s | Target: %s\nNetwork not in table.\n",
 		rrNode.Name, vrfName, target)
-	return []models.BGPRoutePath{}, "No matching route", emptyRaw, true
+	return 0, "No matching route", emptyRaw, true
 }
 
 func stripRDFromPrefix(prefixStr string, rd string) string {
@@ -354,54 +267,35 @@ func stripRDFromPrefix(prefixStr string, rd string) string {
 func maskLengthOfPrefix(prefixStr string, rd string) int {
 	clean := stripRDFromPrefix(prefixStr, rd)
 	if idx := strings.LastIndex(clean, "/"); idx != -1 {
-		if l, err := strconv.Atoi(clean[idx+1:]); err == nil {
+		var l int
+		if _, err := fmt.Sscanf(clean[idx+1:], "%d", &l); err == nil {
 			return l
 		}
 	}
 	return -1
 }
 
-func matchesASPathQuery(routePath models.BGPRoutePath, rawQuery string) bool {
-	cleaned := strings.NewReplacer("^", " ", "$", " ", "_", " ", ",", " ").Replace(rawQuery)
-	tokens := strings.Fields(cleaned)
-	var normTokens []string
-	for _, tok := range tokens {
-		upper := strings.ToUpper(tok)
-		if strings.HasPrefix(upper, "AS") && len(tok) > 2 {
-			tok = tok[2:]
-		}
-		tok = strings.Trim(tok, ".*+?[]()-")
-		if tok != "" {
-			normTokens = append(normTokens, tok)
-		}
+func writeGoBGPCLIHeader(sb *strings.Builder, familyStr string) {
+	if familyStr == "ipv6" {
+		sb.WriteString(fmt.Sprintf("   %-32s %-30s %-6s %-6s %-9s %-24s %s\n",
+			"Network", "Next Hop", "LocPrf", "MED", "Age", "AS_PATH", "Attrs"))
+	} else {
+		sb.WriteString(fmt.Sprintf("   %-20s %-16s %-6s %-6s %-9s %-24s %s\n",
+			"Network", "Next Hop", "LocPrf", "MED", "Age", "AS_PATH", "Attrs"))
 	}
-	if len(normTokens) == 0 {
-		return false
-	}
-	if len(normTokens) == 1 {
-		want := normTokens[0]
-		for _, hop := range routePath.ASPath {
-			if strconv.FormatUint(uint64(hop.ASN), 10) == want {
-				return true
-			}
-		}
-		return strings.Contains(" "+routePath.ASPathString+" ", " "+want+" ")
-	}
-	seq := strings.Join(normTokens, " ")
-	return strings.Contains(" "+routePath.ASPathString+" ", " "+seq+" ")
 }
 
-func matchesCommunityQuery(routePath models.BGPRoutePath, rawLine string, rawQuery string) bool {
+func matchesCommunityList(comms, extComms []string, rawLine, rawQuery string) bool {
 	want := strings.TrimSpace(rawQuery)
 	if want == "" {
 		return false
 	}
-	for _, c := range routePath.Communities {
-		if strings.EqualFold(c.Raw, want) {
+	for _, c := range comms {
+		if strings.EqualFold(c, want) {
 			return true
 		}
 	}
-	for _, ec := range routePath.ExtCommunities {
+	for _, ec := range extComms {
 		if strings.EqualFold(ec, want) || strings.Contains(strings.ToLower(ec), strings.ToLower(want)) {
 			return true
 		}
@@ -411,35 +305,13 @@ func matchesCommunityQuery(routePath models.BGPRoutePath, rawLine string, rawQue
 
 func fastMatchBinaryPath(pattrsBin [][]byte, queryType string, rawQuery string) bool {
 	if len(pattrsBin) == 0 {
-		return true // fall back to full decode when binary attributes are not populated
+		return true
 	}
 	if queryType == "aspath" {
-		cleaned := strings.NewReplacer("^", " ", "$", " ", "_", " ", ",", " ").Replace(rawQuery)
-		tokens := strings.Fields(cleaned)
-		var normTokens []string
-		for _, tok := range tokens {
-			upper := strings.ToUpper(tok)
-			if strings.HasPrefix(upper, "AS") && len(tok) > 2 {
-				tok = tok[2:]
-			}
-			tok = strings.Trim(tok, ".*+?[]()-")
-			if tok != "" {
-				normTokens = append(normTokens, tok)
-			}
-		}
-		if len(normTokens) == 0 {
+		parsedQ, ok := ParseASPathQuery(rawQuery)
+		if !ok {
 			return false
 		}
-		var singleASN uint32
-		isSingle := false
-		if len(normTokens) == 1 {
-			if n, err := strconv.ParseUint(normTokens[0], 10, 32); err == nil {
-				singleASN = uint32(n)
-				isSingle = true
-			}
-		}
-		seq := strings.Join(normTokens, " ")
-
 		for _, attrBytes := range pattrsBin {
 			if len(attrBytes) < 2 || bgp.BGPAttrType(attrBytes[1]) != bgp.BGP_ATTR_TYPE_AS_PATH {
 				continue
@@ -455,28 +327,19 @@ func fastMatchBinaryPath(pattrsBin [][]byte, queryType string, rawQuery string) 
 			if !ok {
 				continue
 			}
-			if isSingle {
-				for _, param := range asAttr.Value {
-					switch seg := param.(type) {
-					case *bgp.As4PathParam:
-						for _, asn := range seg.AS {
-							if asn == singleASN {
-								return true
-							}
-						}
-					case *bgp.AsPathParam:
-						for _, asn := range seg.AS {
-							if uint32(asn) == singleASN {
-								return true
-							}
-						}
+			var routeASNs []uint32
+			for _, param := range asAttr.Value {
+				switch seg := param.(type) {
+				case *bgp.As4PathParam:
+					routeASNs = append(routeASNs, seg.AS...)
+				case *bgp.AsPathParam:
+					for _, asn := range seg.AS {
+						routeASNs = append(routeASNs, uint32(asn))
 					}
 				}
-			} else {
-				asStr := bgp.AsPathString(asAttr)
-				if strings.Contains(" "+asStr+" ", " "+seq+" ") {
-					return true
-				}
+			}
+			if MatchASSequence(routeASNs, parsedQ) {
+				return true
 			}
 		}
 		return false
@@ -491,9 +354,10 @@ func fastMatchBinaryPath(pattrsBin [][]byte, queryType string, rawQuery string) 
 		var hasStdTarget bool
 		var stdTarget uint32
 		if parts := strings.Split(want, ":"); len(parts) == 2 {
-			if h, err1 := strconv.ParseUint(parts[0], 10, 16); err1 == nil {
-				if l, err2 := strconv.ParseUint(parts[1], 10, 16); err2 == nil {
-					stdTarget = (uint32(h) << 16) | uint32(l)
+			var h, l uint32
+			if _, err1 := fmt.Sscanf(parts[0], "%d", &h); err1 == nil && h <= 65535 {
+				if _, err2 := fmt.Sscanf(parts[1], "%d", &l); err2 == nil && l <= 65535 {
+					stdTarget = (h << 16) | l
 					hasStdTarget = true
 				}
 			}
@@ -547,30 +411,33 @@ func (e *Engine) fetchPathsFromStream(
 	ctx context.Context,
 	client apipb.GobgpApiClient,
 	req *apipb.ListPathRequest,
-	rrNode models.RRNodeConfig,
-	view models.RouteViewMeta,
 	familyStr string,
 	queryType string,
 	target string,
 	rd string,
 	maxFilterMatches int,
-) ([]models.BGPRoutePath, string, string, bool) {
+) (int, string, string, bool) {
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
 
 	stream, err := client.ListPath(streamCtx, req)
 	if err != nil {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
 
-	showLabel := req.GetFamily().GetSafi() == apipb.Family_SAFI_MPLS_VPN
-
-	// Mode A: Stream-filter on-the-fly for AS-Path or Community queries (stops immediately once maxFilterMatches paths are found)
+	// Mode A: Stream-filter on-the-fly for AS-Path or Community queries
 	if queryType == "aspath" || queryType == "community" {
 		maxFilterMatches = clampFilterRouteLimit(maxFilterMatches)
-		var results []models.BGPRoutePath
+		var parsedASQuery ASPathQuery
+		if queryType == "aspath" {
+			var ok bool
+			parsedASQuery, ok = ParseASPathQuery(target)
+			if !ok {
+				return 0, "", "", false
+			}
+		}
+
 		var rawLines []string
-		pathSeq := uint32(1)
 		receivedAny := false
 
 		for {
@@ -579,11 +446,10 @@ func (e *Engine) fetchPathsFromStream(
 				break
 			}
 			if err != nil {
-				// If context deadline expired after streaming started, return any matches collected so far
-				if receivedAny || len(results) > 0 {
+				if receivedAny || len(rawLines) > 0 {
 					break
 				}
-				return nil, "", "", false
+				return 0, "", "", false
 			}
 			receivedAny = true
 			dest := resp.GetDestination()
@@ -599,47 +465,38 @@ func (e *Engine) fetchPathsFromStream(
 				if len(p.GetPattrsBinary()) > 0 && !fastMatchBinaryPath(p.GetPattrsBinary(), queryType, target) {
 					continue
 				}
-				routePath, rawLine := e.decodeGoBGPPath(pathSeq, idx == 0, cleanPfx, rd, familyStr, view, p, showLabel)
+				rawLine, asns, comms, extComms := decodeGoBGPPathLine(idx == 0, cleanPfx, rd, familyStr, p)
 				if queryType == "aspath" {
-					if !matchesASPathQuery(routePath, target) {
+					if !MatchASSequence(asns, parsedASQuery) {
 						continue
 					}
 				} else if queryType == "community" {
-					if !matchesCommunityQuery(routePath, rawLine, target) {
+					if !matchesCommunityList(comms, extComms, rawLine, target) {
 						continue
 					}
 				}
-				pathSeq++
-				results = append(results, routePath)
 				rawLines = append(rawLines, rawLine)
-				if len(results) >= maxFilterMatches {
+				if len(rawLines) >= maxFilterMatches {
 					cancelStream()
 					break
 				}
 			}
-			if len(results) >= maxFilterMatches {
+			if len(rawLines) >= maxFilterMatches {
 				break
 			}
 		}
 
-		if len(results) == 0 {
-			return nil, "", "", true
+		if len(rawLines) == 0 {
+			return 0, "", "", true
 		}
 
 		var rawBuilder strings.Builder
-		if familyStr == "ipv6" {
-			rawBuilder.WriteString(fmt.Sprintf("   %-32s %-30s %-6s %-6s %-9s %-24s %s\n",
-				"Network", "Next Hop", "LocPrf", "MED", "Age", "AS_PATH", "Attrs"))
-		} else {
-			rawBuilder.WriteString(fmt.Sprintf("   %-20s %-16s %-6s %-6s %-9s %-24s %s\n",
-				"Network", "Next Hop", "LocPrf", "MED", "Age", "AS_PATH", "Attrs"))
-		}
+		writeGoBGPCLIHeader(&rawBuilder, familyStr)
 		for _, line := range rawLines {
 			rawBuilder.WriteString(line + "\n")
 		}
-
-		summaryLabel := fmt.Sprintf("Filter: %s (%d routes)", target, len(results))
-		return results, summaryLabel, rawBuilder.String(), true
+		summaryLabel := fmt.Sprintf("Filter: %s (%d routes)", target, len(rawLines))
+		return len(rawLines), summaryLabel, rawBuilder.String(), true
 	}
 
 	// Mode B: Prefix lookup (O(1) radix/hash lookup with Longest Prefix Match selection)
@@ -650,57 +507,61 @@ func (e *Engine) fetchPathsFromStream(
 			break
 		}
 		if err != nil {
-			return nil, "", "", false
+			return 0, "", "", false
 		}
-		if dest := resp.GetDestination(); dest != nil && len(dest.GetPaths()) > 0 {
-			allDests = append(allDests, dest)
+		dest := resp.GetDestination()
+		if dest == nil || len(dest.GetPaths()) == 0 {
+			continue
 		}
+		if rd != "" && !strings.HasPrefix(dest.GetPrefix(), rd+":") {
+			continue
+		}
+		allDests = append(allDests, dest)
 	}
 
 	if len(allDests) == 0 {
-		return nil, "", "", true
+		return 0, "", "", true
 	}
 
 	selectedDests := allDests
 	if len(allDests) > 1 {
-		bestDest := allDests[0]
-		bestMask := maskLengthOfPrefix(bestDest.GetPrefix(), rd)
+		bestMask := maskLengthOfPrefix(allDests[0].GetPrefix(), rd)
 		for _, d := range allDests[1:] {
-			m := maskLengthOfPrefix(d.GetPrefix(), rd)
-			if m >= bestMask {
+			if m := maskLengthOfPrefix(d.GetPrefix(), rd); m > bestMask {
 				bestMask = m
-				bestDest = d
 			}
 		}
-		selectedDests = []*apipb.Destination{bestDest}
+		var longest []*apipb.Destination
+		for _, d := range allDests {
+			if maskLengthOfPrefix(d.GetPrefix(), rd) == bestMask {
+				longest = append(longest, d)
+			}
+		}
+		if len(longest) > 0 {
+			selectedDests = longest
+		}
 	}
 
-	var results []models.BGPRoutePath
 	var rawLines []string
 	var matchedPrefix string
-	pathSeq := uint32(1)
-
 	for _, dest := range selectedDests {
 		cleanPfx := stripRDFromPrefix(dest.GetPrefix(), rd)
 		if matchedPrefix == "" {
 			matchedPrefix = cleanPfx
 		}
 		for idx, p := range dest.GetPaths() {
-			routePath, rawLine := e.decodeGoBGPPath(pathSeq, idx == 0, cleanPfx, rd, familyStr, view, p, showLabel)
-			pathSeq++
-			results = append(results, routePath)
+			rawLine, _, _, _ := decodeGoBGPPathLine(idx == 0, cleanPfx, rd, familyStr, p)
 			rawLines = append(rawLines, rawLine)
 		}
 	}
 
 	var rawBuilder strings.Builder
-	rawBuilder.WriteString(fmt.Sprintf("   %-20s %-16s %-6s %-6s %-9s %-24s %s\n",
-		"Network", "Next Hop", "LocPrf", "MED", "Age", "AS_PATH", "Attrs"))
+	writeGoBGPCLIHeader(&rawBuilder, familyStr)
 	for _, line := range rawLines {
 		rawBuilder.WriteString(line + "\n")
 	}
 
-	return results, matchedPrefix, rawBuilder.String(), true
+	return len(rawLines), matchedPrefix, rawBuilder.String(), true
 }
 
 func formatGoBGPTimedelta(t time.Time) string {
@@ -737,8 +598,11 @@ func getNativeNextHop(attrs []bgp.PathAttributeInterface) net.IP {
 	return nil
 }
 
-func formatFullWidthPathLine(leftCols string, stdComms, extComms, largeComms []string) string {
+func formatFullWidthPathLine(leftCols string, stdComms, extComms, largeComms []string, rpkiTag string) string {
 	var tokens []string
+	if rpkiTag != "" {
+		tokens = append(tokens, "{RPKI: "+rpkiTag+"}")
+	}
 	if len(stdComms) > 0 {
 		for i, c := range stdComms {
 			tok := c
@@ -820,30 +684,16 @@ func formatFullWidthPathLine(leftCols string, stdComms, extComms, largeComms []s
 	return sb.String()
 }
 
-func (e *Engine) decodeGoBGPPath(
-	seqID uint32,
+func decodeGoBGPPathLine(
 	isFirst bool,
 	cleanPrefix string,
 	vrfRD string,
 	familyStr string,
-	view models.RouteViewMeta,
 	p *apipb.Path,
-	showLabel bool,
-) (models.BGPRoutePath, string) {
+) (rawLine string, asns []uint32, rawComms []string, extComms []string) {
 	best := (p.GetBest() || isFirst) && !p.GetIsNexthopInvalid()
-	pathID := p.GetIdentifier()
-	if pathID == 0 {
-		pathID = seqID
-	}
-
-	peerIP := p.GetNeighborIp()
-	if peerIP == "" || peerIP == "<nil>" {
-		peerIP = view.JuniperSourceIPv4
-	}
-
 	nativeAttrs, _ := apiutil.GetNativePathAttributes(p)
 
-	originStr := "IGP"
 	originShort := "i"
 	nextHop := ""
 	if nh := getNativeNextHop(nativeAttrs); nh != nil {
@@ -851,27 +701,19 @@ func (e *Engine) decodeGoBGPPath(
 	}
 	localPref := uint32(100)
 	med := uint32(0)
-	var asns []uint32
 	var asPathStr string
 	var stdComms []string
 	var largeComms []string
-	var rawComms []string
-	var extComms []string
-	var originatorID string
-	var clusterList []string
 
 	for _, attr := range nativeAttrs {
 		switch a := attr.(type) {
 		case *bgp.PathAttributeOrigin:
 			switch a.Value {
 			case bgp.BGP_ORIGIN_ATTR_TYPE_IGP:
-				originStr = "IGP"
 				originShort = "i"
 			case bgp.BGP_ORIGIN_ATTR_TYPE_EGP:
-				originStr = "EGP"
 				originShort = "e"
 			default:
-				originStr = "Incomplete"
 				originShort = "?"
 			}
 		case *bgp.PathAttributeLocalPref:
@@ -893,11 +735,9 @@ func (e *Engine) decodeGoBGPPath(
 		case *bgp.PathAttributeCommunities:
 			for _, c := range a.Value {
 				if c == 0xffff0004 {
-					continue // Skip internal RFC/Juniper route-filter-translated-v6 marker
+					continue
 				}
-				high := (c >> 16) & 0xffff
-				low := c & 0xffff
-				val := fmt.Sprintf("%d:%d", high, low)
+				val := fmt.Sprintf("%d:%d", (c>>16)&0xffff, c&0xffff)
 				stdComms = append(stdComms, val)
 				rawComms = append(rawComms, val)
 			}
@@ -910,75 +750,35 @@ func (e *Engine) decodeGoBGPPath(
 		case *bgp.PathAttributeExtendedCommunities:
 			for _, ec := range a.Value {
 				ecStr := strings.TrimSpace(ec.String())
-				// Filter out the GoBGP VRF's internal Route-Target (matching vrfRD) while keeping all Traffic Engineering Extcomms
 				if vrfRD != "" && strings.EqualFold(ecStr, vrfRD) {
 					continue
 				}
 				extComms = append(extComms, ecStr)
 			}
-		case *bgp.PathAttributeOriginatorId:
-			if a.Value != nil {
-				originatorID = a.Value.String()
-			}
-		case *bgp.PathAttributeClusterList:
-			for _, cl := range a.Value {
-				clusterList = append(clusterList, cl.String())
-			}
 		}
 	}
 
-	hops := make([]models.ASHop, 0, len(asns))
-	strParts := make([]string, 0, len(asns))
-	for _, asn := range asns {
-		hops = append(hops, e.ResolveASN(asn))
-		strParts = append(strParts, strconv.FormatUint(uint64(asn), 10))
-	}
-	if asPathStr == "" {
-		asPathStr = strings.Join(strParts, " ")
+	if asPathStr == "" && len(asns) > 0 {
+		parts := make([]string, len(asns))
+		for i, n := range asns {
+			parts[i] = fmt.Sprintf("%d", n)
+		}
+		asPathStr = strings.Join(parts, " ")
 	}
 
-	var originASN uint32
-	var originName string
-	if len(hops) > 0 {
-		last := hops[len(hops)-1]
-		originASN = last.ASN
-		originName = last.Name
-	}
-
-	rpkiStr := "NotFound"
+	rpkiTag := ""
 	if p.GetValidation() != nil {
 		switch p.GetValidation().GetState() {
 		case apipb.Validation_STATE_VALID:
-			rpkiStr = "Valid"
+			rpkiTag = "Valid"
 		case apipb.Validation_STATE_INVALID:
-			rpkiStr = "Invalid"
+			rpkiTag = "Invalid"
 		}
 	}
 
 	ageStr := "00:00:00"
 	if ts := p.GetAge(); ts != nil {
 		ageStr = formatGoBGPTimedelta(ts.AsTime())
-	}
-
-	var metaParts []string
-	if len(extComms) > 0 {
-		metaParts = append(metaParts, fmt.Sprintf("ExtComms: [%s]", strings.Join(extComms, ", ")))
-	}
-	if originatorID != "" {
-		metaParts = append(metaParts, fmt.Sprintf("Originator: %s", originatorID))
-	}
-	if len(clusterList) > 0 {
-		metaParts = append(metaParts, fmt.Sprintf("ClusterList: [%s]", strings.Join(clusterList, " ")))
-	}
-
-	ispLabel := fmt.Sprintf("Original eBGP Next-Hop (%s)", view.Name)
-	if len(metaParts) > 0 {
-		ispLabel = strings.Join(metaParts, " · ")
-	}
-
-	note := fmt.Sprintf("Add-Path Candidate (#%d)", seqID)
-	if best {
-		note = "Best Path (*> Selected in GoBGP RIB)"
 	}
 
 	symbol := "* "
@@ -994,34 +794,12 @@ func (e *Engine) decodeGoBGPPath(
 		leftCols = fmt.Sprintf("%-2s %-20s %-16s %-6d %-6d %-9s %-24s ",
 			symbol, cleanPrefix, nextHop, localPref, med, ageStr, asDisplay)
 	}
-	rawLine := formatFullWidthPathLine(leftCols, stdComms, extComms, largeComms)
-
-	return models.BGPRoutePath{
-		PathID:         pathID,
-		Prefix:         cleanPrefix,
-		AddressFamily:  familyStr,
-		Best:           best,
-		NextHop:        nextHop,
-		NextHopISP:     ispLabel,
-		ASPath:         hops,
-		ASPathString:   asPathStr,
-		Origin:         originStr,
-		LocalPref:      localPref,
-		MED:            med,
-		Communities:    e.TranslateCommunities(rawComms),
-		ExtCommunities: extComms,
-		PeerIP:         peerIP,
-		OriginASN:      originASN,
-		OriginName:     originName,
-		RPKIStatus:     rpkiStr,
-		Age:            ageStr,
-		ValidationNote: note,
-	}, rawLine
+	rawLine = formatFullWidthPathLine(leftCols, stdComms, extComms, largeComms, rpkiTag)
+	return rawLine, asns, rawComms, extComms
 }
 
-// queryLiveGoBGPNeighbors queries GoBGP's ListPeer gRPC API to return real-time neighbor state, uptime, and prefix counts
-// strictly matched per VRF on this specific RR node. Never borrows another VRF's peer!
-// Returns (summaries, rrReachable).
+// queryLiveGoBGPNeighbors queries GoBGP's ListPeer gRPC API to return real-time neighbor state, uptime, prefix counts,
+// and actual negotiated Add-Path RX / iBGP Next-Hop Unchanged status per VRF.
 func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNodeConfig, views []models.RouteViewMeta) ([]models.BGPNeighborSummary, bool) {
 	client, err := defaultPool.getClient(rrNode.Endpoint)
 	if err != nil {
@@ -1031,7 +809,7 @@ func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNo
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	stream, err := client.ListPeer(cctx, &apipb.ListPeerRequest{})
+	stream, err := client.ListPeer(cctx, &apipb.ListPeerRequest{EnableAdvertised: false})
 	if err != nil {
 		return nil, false
 	}
@@ -1100,7 +878,7 @@ func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNo
 				SessionState:     "No Peer / Idle",
 				Uptime:           "-",
 				AddPathRx:        false,
-				NextHopUnchanged: true,
+				NextHopUnchanged: false,
 				PrefixesIPv4:     0,
 				PrefixesIPv6:     0,
 				UpdatesReceived:  0,
@@ -1116,6 +894,10 @@ func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNo
 			peerASN := matchedPeer.GetState().GetPeerAsn()
 			if peerASN == 0 {
 				peerASN = matchedPeer.GetConf().GetPeerAsn()
+			}
+			localASN := matchedPeer.GetState().GetLocalAsn()
+			if localASN == 0 {
+				localASN = matchedPeer.GetConf().GetLocalAsn()
 			}
 
 			stateStr := "Idle"
@@ -1137,8 +919,14 @@ func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNo
 				uptimeStr = formatGoBGPTimedelta(matchedPeer.GetTimers().GetState().GetUptime().AsTime())
 			}
 
-			var rxV4, rxV6, totalRx uint64
+			var rxV4, rxV6, totalRxPfx uint64
+			addPathRx := false
 			for _, afisafi := range matchedPeer.GetAfiSafis() {
+				if ap := afisafi.GetAddPaths(); ap != nil {
+					if ap.GetState().GetReceive() || ap.GetConfig().GetReceive() {
+						addPathRx = true
+					}
+				}
 				st := afisafi.GetState()
 				if st == nil {
 					continue
@@ -1147,13 +935,24 @@ func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNo
 				if acc == 0 {
 					acc = st.GetReceived()
 				}
-				totalRx += st.GetReceived()
+				totalRxPfx += st.GetReceived()
 				if st.GetFamily().GetAfi() == apipb.Family_AFI_IP6 {
 					rxV6 += acc
 				} else {
 					rxV4 += acc
 				}
 			}
+
+			updatesRx := matchedPeer.GetState().GetMessages().GetReceived().GetUpdate()
+			if updatesRx == 0 {
+				updatesRx = totalRxPfx
+			}
+
+			// Next-Hop is preserved unmodified on GoBGP read-only iBGP collectors and Route Server clients
+			nhUnchanged := matchedPeer.GetState().GetType() == apipb.PeerType_INTERNAL ||
+				matchedPeer.GetConf().GetType() == apipb.PeerType_INTERNAL ||
+				(localASN > 0 && localASN == peerASN) ||
+				matchedPeer.GetRouteServer().GetRouteServerClient()
 
 			summaries = append(summaries, models.BGPNeighborSummary{
 				POP:              rrNode.Location,
@@ -1168,11 +967,11 @@ func (e *Engine) queryLiveGoBGPNeighbors(ctx context.Context, rrNode models.RRNo
 				PeerASN:          peerASN,
 				SessionState:     stateStr,
 				Uptime:           uptimeStr,
-				AddPathRx:        true,
-				NextHopUnchanged: true,
+				AddPathRx:        addPathRx,
+				NextHopUnchanged: nhUnchanged,
 				PrefixesIPv4:     int(rxV4),
 				PrefixesIPv6:     int(rxV6),
-				UpdatesReceived:  int64(totalRx),
+				UpdatesReceived:  int64(updatesRx),
 			})
 		}
 	}

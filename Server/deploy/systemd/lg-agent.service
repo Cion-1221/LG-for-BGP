@@ -1,0 +1,17 @@
+[Unit]
+Description=LG-for-BGP Lightweight Remote BGP Collector Agent (BIRD 2 / FRR)
+After=network-online.target frr.service bird.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lg-for-bgp
+# Optional TLS flags for cross-PoP / WAN links: -tls-cert /etc/lg-for-bgp/agent.crt -tls-key /etc/lg-for-bgp/agent.key
+ExecStart=/opt/lg-for-bgp/lg-agent -listen 0.0.0.0:9090 -engine auto -socket local -token ChangeMe_StrongAgentToken_2026
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

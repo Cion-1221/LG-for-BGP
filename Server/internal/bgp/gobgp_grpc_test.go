@@ -5,6 +5,7 @@ import (
 	"context"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,12 +23,16 @@ import (
 
 type mockGoBGPServer struct {
 	apipb.UnimplementedGobgpApiServer
-	vrfName string
-	rdStr   string
-	lastReq *apipb.ListPathRequest
+	vrfName         string
+	rdStr           string
+	globalLeakRoute bool
+	lastReq         *apipb.ListPathRequest
 }
 
 func (m *mockGoBGPServer) ListVrf(_ *apipb.ListVrfRequest, stream apipb.GobgpApi_ListVrfServer) error {
+	if m.rdStr == "" {
+		return nil
+	}
 	rdObj, err := bgp.ParseRouteDistinguisher(m.rdStr)
 	if err != nil {
 		return err
@@ -47,8 +52,24 @@ func (m *mockGoBGPServer) ListVrf(_ *apipb.ListVrfRequest, stream apipb.GobgpApi
 
 func (m *mockGoBGPServer) ListPath(req *apipb.ListPathRequest, stream apipb.GobgpApi_ListPathServer) error {
 	m.lastReq = req
-	// Verify that the driver sends TableType_GLOBAL + SAFI_MPLS_VPN (vpnv4) + Rd + /32 CIDR + SHORTER
 	if req.GetTableType() != apipb.TableType_GLOBAL {
+		return nil
+	}
+	if req.GetFamily().GetSafi() == apipb.Family_SAFI_UNICAST {
+		if m.globalLeakRoute {
+			nlri := bgp.NewIPAddrPrefix(24, "9.9.9.0")
+			attrs := []bgp.PathAttributeInterface{
+				bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP),
+				bgp.NewPathAttributeNextHop("192.0.2.99"),
+			}
+			pGlobal, _ := apiutil.NewPath(nlri, false, attrs, time.Now())
+			return stream.Send(&apipb.ListPathResponse{
+				Destination: &apipb.Destination{
+					Prefix: "9.9.9.0/24",
+					Paths:  []*apipb.Path{pGlobal},
+				},
+			})
+		}
 		return nil
 	}
 	if req.GetFamily().GetSafi() != apipb.Family_SAFI_MPLS_VPN {
@@ -111,13 +132,14 @@ func (m *mockGoBGPServer) ListPath(req *apipb.ListPathRequest, stream apipb.Gobg
 	})
 }
 
-func TestGoBGPgRPCVPNv4VrfLookup(t *testing.T) {
+func TestGoBGPgRPCVPNv4VrfLookupAndStrictIsolation(t *testing.T) {
 	lis := bufconn.Listen(1024 * 1024)
 	defer lis.Close()
 
 	mockSrv := &mockGoBGPServer{
-		vrfName: "VRF-CN-OPTIMIZE",
-		rdStr:   "65000:1",
+		vrfName:         "VRF-CN-OPTIMIZE",
+		rdStr:           "65000:1",
+		globalLeakRoute: true,
 	}
 	grpcServer := grpc.NewServer()
 	apipb.RegisterGobgpApiServer(grpcServer, mockSrv)
@@ -138,12 +160,16 @@ func TestGoBGPgRPCVPNv4VrfLookup(t *testing.T) {
 	}
 	defer conn.Close()
 	defaultPool.setConn("bufconn-rr:50051", conn)
+	defer CloseGRPCConnection("bufconn-rr:50051")
 
 	st, err := store.NewAppStore(filepath.Join(t.TempDir(), "test.json"))
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
-	eng := NewEngine(st, security.NewTTLCache())
+	defer func() { _ = st.Close() }()
+	cache := security.NewTTLCache()
+	defer cache.Close()
+	eng := NewEngine(st, cache)
 
 	rrNode := models.RRNodeConfig{
 		ID:         "rr-test",
@@ -162,57 +188,59 @@ func TestGoBGPgRPCVPNv4VrfLookup(t *testing.T) {
 		JuniperSourceIPv4: "192.168.0.46",
 	}
 
-	paths, matched, rawOut, ok := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "prefix", "202.96.134.133")
-	if !ok {
-		t.Fatalf("expected queryLiveGoBGPgRPC to succeed")
-	}
-	if len(paths) != 1 {
-		t.Fatalf("expected 1 path, got %d", len(paths))
+	totalPaths, matched, rawOut, ok := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "prefix", "202.96.134.133")
+	if !ok || totalPaths != 1 {
+		t.Fatalf("expected 1 matched path, got ok=%v total=%d", ok, totalPaths)
 	}
 	if matched != "202.96.128.0/18" {
 		t.Fatalf("expected matched prefix 202.96.128.0/18, got %s", matched)
 	}
-	if paths[0].NextHop != "172.31.255.10" {
-		t.Fatalf("expected NextHop 172.31.255.10, got %s", paths[0].NextHop)
-	}
-	if paths[0].ASPathString != "23764 4134" {
-		t.Fatalf("expected AS_PATH '23764 4134', got %q", paths[0].ASPathString)
-	}
-	if paths[0].LocalPref != 350 {
-		t.Fatalf("expected LocalPref 350, got %d", paths[0].LocalPref)
+	for _, token := range []string{"172.31.255.10", "23764 4134", "350"} {
+		if !strings.Contains(rawOut, token) {
+			t.Fatalf("expected CLI raw_output to contain %q, got:\n%s", token, rawOut)
+		}
 	}
 	if mockSrv.lastReq.GetPrefixes()[0].GetPrefix() != "202.96.134.133/32" {
 		t.Fatalf("expected /32 CIDR lookup prefix, got %s", mockSrv.lastReq.GetPrefixes()[0].GetPrefix())
 	}
-	t.Logf("Raw output:\n%s", rawOut)
 
-	// Verify AS-Path query ("AS4134") returns BOTH IPv4 and IPv6 routes!
-	asPaths, asMatched, asRaw, okAS := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "aspath", "AS4134")
-	if !okAS || len(asPaths) != 2 {
-		t.Fatalf("expected dual-stack AS-Path lookup for AS4134 to return 2 paths (IPv4+IPv6), got %d (matched=%s raw=%s)", len(asPaths), asMatched, asRaw)
-	}
-	if asPaths[0].AddressFamily != "ipv4" || asPaths[1].AddressFamily != "ipv6" {
-		t.Fatalf("expected IPv4 + IPv6 paths in AS-Path lookup, got %s and %s", asPaths[0].AddressFamily, asPaths[1].AddressFamily)
+	// Verify IPv6 prefix lookup uses wide IPv6 column headers cleanly
+	v6Count, v6Matched, v6Raw, okV6 := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "prefix", "240e:100::1")
+	if !okV6 || v6Count != 1 || v6Matched != "240e:100::/32" || !strings.Contains(v6Raw, "2001:db8::1") {
+		t.Fatalf("unexpected IPv6 prefix lookup: count=%d matched=%s raw=%s", v6Count, v6Matched, v6Raw)
 	}
 
-	// Verify BGP Community query ("23764:11100") returns BOTH IPv4 and IPv6 routes!
-	commPaths, commMatched, _, okComm := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "community", "23764:11100")
-	if !okComm || len(commPaths) != 2 {
-		t.Fatalf("expected dual-stack Community lookup for 23764:11100 to return 2 paths (IPv4+IPv6), got %d (matched=%s)", len(commPaths), commMatched)
+	// Verify AS-Path anchor semantics (^ and $) on path "23764 4134":
+	//  - "^23764" & "4134$" MUST match (2 paths: 1 IPv4 + 1 IPv6)
+	//  - "^4134" & "23764$" MUST NOT match (0 paths)
+	if cnt, _, _, ok := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "aspath", "^23764"); !ok || cnt != 2 {
+		t.Fatalf("expected ^23764 to match 2 dual-stack paths, got %d", cnt)
 	}
-	if commPaths[0].AddressFamily != "ipv4" || commPaths[1].AddressFamily != "ipv6" {
-		t.Fatalf("expected IPv4 + IPv6 paths in Community lookup, got %s and %s", commPaths[0].AddressFamily, commPaths[1].AddressFamily)
+	if cnt, _, _, ok := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "aspath", "4134$"); !ok || cnt != 2 {
+		t.Fatalf("expected 4134$ to match 2 dual-stack paths, got %d", cnt)
+	}
+	if cnt, _, _, ok := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "aspath", "^4134"); !ok || cnt != 0 {
+		t.Fatalf("expected ^4134 NOT to match transit hop 23764->4134, got %d", cnt)
+	}
+	if cnt, _, _, ok := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "aspath", "23764$"); !ok || cnt != 0 {
+		t.Fatalf("expected 23764$ NOT to match non-origin hop 23764->4134, got %d", cnt)
 	}
 
-	// Verify dynamic IPv4/IPv6 filter route limits from settings (default 50/50 -> custom 200/100)
-	if v4, v6 := eng.filterRouteLimits(); v4 != 50 || v6 != 50 {
-		t.Fatalf("expected default filter route limits 50/50, got %d/%d", v4, v6)
+	// Verify BGP Community query ("23764:11100") returns BOTH IPv4 and IPv6 routes
+	commCount, _, commRaw, okComm := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, view, "community", "23764:11100")
+	if !okComm || commCount != 2 || !strings.Contains(commRaw, "IPv4 Routes") || !strings.Contains(commRaw, "IPv6 Routes") {
+		t.Fatalf("expected dual-stack Community lookup to return 2 routes, got %d", commCount)
 	}
-	curSettings := st.GetAdminSettings()
-	curSettings.MaxFilterRoutesV4 = 200
-	curSettings.MaxFilterRoutesV6 = 100
-	_, _ = st.UpdateSettings(curSettings)
-	if v4, v6 := eng.filterRouteLimits(); v4 != 200 || v6 != 100 {
-		t.Fatalf("expected updated filter route limits 200/100, got %d/%d", v4, v6)
+
+	// CRITICAL VRF ISOLATION CHECK: Querying an unconfigured VRF ("VRF-NONEXISTENT") MUST NOT leak the Global Unicast route (9.9.9.0/24)!
+	unconfiguredView := models.RouteViewMeta{
+		ID:      "vrf_missing",
+		Name:    "Missing VRF",
+		VRFName: "VRF-NONEXISTENT",
+		Type:    "gobgp",
+	}
+	missCount, missMatched, missRaw, okMiss := eng.queryLiveGoBGPgRPC(context.Background(), rrNode, unconfiguredView, "prefix", "9.9.9.9")
+	if !okMiss || missCount != 0 || strings.Contains(missRaw, "9.9.9.0/24") {
+		t.Fatalf("VRF isolation breach: unconfigured VRF leaked Global RIB route! count=%d matched=%s raw=%s", missCount, missMatched, missRaw)
 	}
 }

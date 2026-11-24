@@ -1,0 +1,21 @@
+[Unit]
+Description=LG-for-BGP Multi-Instance Looking Glass API Server
+After=network-online.target mariadb.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lg-bgp
+Group=lg-bgp
+WorkingDirectory=/opt/lg-for-bgp
+ExecStart=/opt/lg-for-bgp/lg-server -config /etc/lg-for-bgp/config.yaml
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lg-for-bgp /var/log/lg-for-bgp /opt/lg-for-bgp
+
+[Install]
+WantedBy=multi-user.target

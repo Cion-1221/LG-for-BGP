@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS lg_vrfs (
     pop TEXT NOT NULL DEFAULT 'all',
     rr_node_ids TEXT NOT NULL DEFAULT '["all"]',
     juniper_source_ipv4 TEXT NOT NULL DEFAULT '',
+    bird_table_v6 TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
     sort_order INTEGER NOT NULL DEFAULT 0
 );

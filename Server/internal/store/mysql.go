@@ -13,9 +13,6 @@ import (
 	"lg-for-bgp/internal/models"
 )
 
-// Note: BGP routing tables (RIBs) are NOT stored in MySQL/MariaDB.
-// All BGP routes and routing tables reside strictly in each RR's in-memory RIBs.
-// MySQL/MariaDB only stores system settings, PoP groups, VRF views, RR node endpoints, user accounts, and audit logs.
 const mysqlSchemaDDL = `
 CREATE TABLE IF NOT EXISTS lg_settings (
     id INT PRIMARY KEY DEFAULT 1,
@@ -45,6 +42,7 @@ CREATE TABLE IF NOT EXISTS lg_vrfs (
     pop VARCHAR(64) NOT NULL DEFAULT 'all',
     rr_node_ids JSON NULL,
     juniper_source_ipv4 VARCHAR(64) NOT NULL DEFAULT '',
+    bird_table_v6 VARCHAR(128) NOT NULL DEFAULT '',
     description TEXT NOT NULL,
     sort_order INT NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -128,6 +126,7 @@ func (s *AppStore) initMySQL(dsn string) error {
 	_, _ = s.db.Exec("ALTER TABLE lg_users ADD COLUMN must_change_password TINYINT(1) NOT NULL DEFAULT 0")
 	_, _ = s.db.Exec("ALTER TABLE lg_vrfs ADD COLUMN pop VARCHAR(64) NOT NULL DEFAULT 'all'")
 	_, _ = s.db.Exec("ALTER TABLE lg_vrfs ADD COLUMN rr_node_ids JSON NULL")
+	_, _ = s.db.Exec("ALTER TABLE lg_vrfs ADD COLUMN bird_table_v6 VARCHAR(128) NOT NULL DEFAULT ''")
 	_, _ = s.db.Exec("ALTER TABLE lg_rr_nodes ADD COLUMN agent_token VARCHAR(255) NOT NULL DEFAULT ''")
 	_, _ = s.db.Exec("ALTER TABLE lg_settings ADD COLUMN favicon_icon MEDIUMTEXT NULL")
 	_, _ = s.db.Exec("ALTER TABLE lg_settings ADD COLUMN portal_logo MEDIUMTEXT NULL")
@@ -264,13 +263,13 @@ func (s *AppStore) syncAllToMySQLLocked() error {
 		}
 		rrIDsJSON, _ := json.Marshal(rrIDs)
 		_, err := tx.Exec(`
-			INSERT INTO lg_vrfs (id, name, vrf_name, type, pop, rr_node_ids, juniper_source_ipv4, description, sort_order)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO lg_vrfs (id, name, vrf_name, type, pop, rr_node_ids, juniper_source_ipv4, bird_table_v6, description, sort_order)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
 				name=VALUES(name), vrf_name=VALUES(vrf_name), type=VALUES(type), pop=VALUES(pop),
 				rr_node_ids=VALUES(rr_node_ids), juniper_source_ipv4=VALUES(juniper_source_ipv4),
-				description=VALUES(description), sort_order=VALUES(sort_order)
-		`, string(v.ID), v.Name, vrfName, vType, vPop, string(rrIDsJSON), v.JuniperSourceIPv4, v.Description, idx)
+				bird_table_v6=VALUES(bird_table_v6), description=VALUES(description), sort_order=VALUES(sort_order)
+		`, string(v.ID), v.Name, vrfName, vType, vPop, string(rrIDsJSON), v.JuniperSourceIPv4, v.BirdTableV6, v.Description, idx)
 		if err != nil {
 			return err
 		}
@@ -369,9 +368,8 @@ func (s *AppStore) loadFromMySQLLocked() error {
 	s.data.Settings.AccessMode = models.AccessMode(modeStr)
 	_ = json.Unmarshal([]byte(pubViewsRaw), &s.data.Settings.PublicAllowedViews)
 
-	// Load VRF Configurations (Name, VRFName, Type, POP, RRNodeIDs)
 	vRows, err := s.db.Query(`
-		SELECT id, name, vrf_name, type, COALESCE(pop, 'all'), COALESCE(CAST(rr_node_ids AS CHAR), ''), juniper_source_ipv4, description
+		SELECT id, name, vrf_name, type, COALESCE(pop, 'all'), COALESCE(CAST(rr_node_ids AS CHAR), ''), juniper_source_ipv4, COALESCE(bird_table_v6, ''), description
 		FROM lg_vrfs ORDER BY sort_order ASC, id ASC
 	`)
 	if err == nil {
@@ -380,7 +378,7 @@ func (s *AppStore) loadFromMySQLLocked() error {
 		for vRows.Next() {
 			var v models.RouteViewMeta
 			var idStr, rrIDsRaw string
-			if err := vRows.Scan(&idStr, &v.Name, &v.VRFName, &v.Type, &v.POP, &rrIDsRaw, &v.JuniperSourceIPv4, &v.Description); err == nil {
+			if err := vRows.Scan(&idStr, &v.Name, &v.VRFName, &v.Type, &v.POP, &rrIDsRaw, &v.JuniperSourceIPv4, &v.BirdTableV6, &v.Description); err == nil {
 				v.ID = models.RouteViewID(idStr)
 				if strings.TrimSpace(rrIDsRaw) != "" {
 					_ = json.Unmarshal([]byte(rrIDsRaw), &v.RRNodeIDs)
@@ -392,7 +390,6 @@ func (s *AppStore) loadFromMySQLLocked() error {
 		s.data.RouteViews = loadedViews
 	}
 
-	// Load POPs
 	pRows, err := s.db.Query(`SELECT id, name, description, sort_order FROM lg_pops ORDER BY sort_order ASC, id ASC`)
 	if err == nil {
 		defer pRows.Close()
@@ -405,7 +402,6 @@ func (s *AppStore) loadFromMySQLLocked() error {
 		}
 	}
 
-	// Load RRNodes
 	rRows, err := s.db.Query(`
 		SELECT id, name, location, engine_type, loopback_ip, endpoint, COALESCE(agent_token, ''), role, enabled, healthy, last_checked
 		FROM lg_rr_nodes ORDER BY id ASC
@@ -428,7 +424,6 @@ func (s *AppStore) loadFromMySQLLocked() error {
 	s.ensurePOPsFromRRNodesLocked()
 	migrated := s.migrateLegacyViewBindingsLocked()
 
-	// Load Users
 	uRows, err := s.db.Query(`
 		SELECT id, username, password_hash, display_name, company, customer_asn,
 		       role, allowed_views, rate_limit_per_minute, enabled, must_change_password, notes, created_at, last_login_at
@@ -457,7 +452,6 @@ func (s *AppStore) loadFromMySQLLocked() error {
 		s.data.Users = append(s.data.Users, u)
 	}
 
-	// Automatically prune any deleted/stale VRF IDs incrementally
 	if s.pruneStaleViewIDsLocked() {
 		_ = s.syncAllowedViewsDBLocked()
 	}
@@ -467,20 +461,23 @@ func (s *AppStore) loadFromMySQLLocked() error {
 		}
 	}
 
-	// Load recent 1000 Audit Logs
 	aRows, err := s.db.Query(`
 		SELECT timestamp, username, client_ip, action, COALESCE(query_type,''), COALESCE(target,''), COALESCE(views,''), COALESCE(rr_node,''), duration_ms
 		FROM lg_audit_logs ORDER BY id DESC LIMIT 1000
 	`)
 	if err == nil {
 		defer aRows.Close()
-		s.data.AuditLogs = nil
+		var loadedLogs []models.AuditLogEntry
 		for aRows.Next() {
 			var a models.AuditLogEntry
 			if err := aRows.Scan(&a.Timestamp, &a.Username, &a.ClientIP, &a.Action, &a.QueryType, &a.Target, &a.Views, &a.RRNode, &a.DurationMs); err == nil {
-				s.data.AuditLogs = append(s.data.AuditLogs, a)
+				loadedLogs = append(loadedLogs, a)
 			}
 		}
+		s.data.AuditLogs = loadedLogs
+		s.auditMu.Lock()
+		s.auditLogs = append([]models.AuditLogEntry(nil), loadedLogs...)
+		s.auditMu.Unlock()
 	}
 
 	return nil

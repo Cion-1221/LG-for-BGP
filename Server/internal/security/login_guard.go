@@ -11,23 +11,34 @@ import (
 	"lg-for-bgp/internal/models"
 )
 
+const defaultLoginGuardMaxEntries = 16384
+
 type loginTracker struct {
 	key         string
-	kind        string // "ip" or "username"
-	value       string
+	kind        string // "ip" or "ip+user"
+	value       string // Display value, e.g. "203.0.113.10" or "admin @ 203.0.113.10"
+	ip          string
+	username    string
 	failures    int
 	firstFail   time.Time
 	lastAttempt time.Time
 	lockedUntil time.Time
 }
 
-// LoginGuard protects /api/v1/auth/login against brute-force password guessing.
-// It tracks failed logins per client IP and per username, automatically locking out
-// after maxFailures within windowDuration, and supports admin inspection + manual unban.
+// LoginGuard protects /api/v1/auth/login against brute-force password guessing without
+// enabling Account Lockout DoS against legitimate users/administrators on other IPs.
+//
+// Security design:
+//   - Tracks per-IP (`ip:<ip>`) AND per-(IP, Username) (`pair:<ip>|<user>`), NEVER a global `user:<username>` lock,
+//     so an external attacker guessing "admin" cannot lock out the real administrator logging in from another IP.
+//   - `RecordSuccess(ip, user)` ONLY removes `pair:<ip>|<user>` and subtracts ONLY that pair's prior failure count
+//     from `ip:<ip>`, preventing an attacker from resetting their IP failure counter by signing into a throwaway account.
+//   - Bounded `maxEntries` map prevents memory exhaustion under random-IP / random-username floods.
 type LoginGuard struct {
 	mu             sync.Mutex
 	entries        map[string]*loginTracker
 	maxFailures    int
+	maxEntries     int
 	windowDuration time.Duration
 	lockDuration   time.Duration
 	stopCh         chan struct{}
@@ -47,6 +58,7 @@ func NewLoginGuard(maxFailures int, windowDuration, lockDuration time.Duration) 
 	g := &LoginGuard{
 		entries:        make(map[string]*loginTracker),
 		maxFailures:    maxFailures,
+		maxEntries:     defaultLoginGuardMaxEntries,
 		windowDuration: windowDuration,
 		lockDuration:   lockDuration,
 		stopCh:         make(chan struct{}),
@@ -77,6 +89,10 @@ func (g *LoginGuard) gcLoop() {
 func (g *LoginGuard) pruneExpired(now time.Time) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.pruneExpiredLocked(now)
+}
+
+func (g *LoginGuard) pruneExpiredLocked(now time.Time) {
 	for k, tr := range g.entries {
 		lockExpired := tr.lockedUntil.IsZero() || !now.Before(tr.lockedUntil)
 		windowExpired := now.Sub(tr.lastAttempt) > g.windowDuration
@@ -86,26 +102,62 @@ func (g *LoginGuard) pruneExpired(now time.Time) {
 	}
 }
 
+func (g *LoginGuard) ensureCapacityLocked(now time.Time) {
+	if len(g.entries) < g.maxEntries {
+		return
+	}
+	g.pruneExpiredLocked(now)
+	if len(g.entries) < g.maxEntries {
+		return
+	}
+	// Evict oldest unlocked entries first, then oldest lastAttempt entries
+	evict := g.maxEntries / 10
+	if evict < 1 {
+		evict = 1
+	}
+	for k, tr := range g.entries {
+		if tr.lockedUntil.IsZero() || !now.Before(tr.lockedUntil) {
+			delete(g.entries, k)
+			evict--
+			if evict <= 0 {
+				return
+			}
+		}
+	}
+	for k := range g.entries {
+		delete(g.entries, k)
+		evict--
+		if evict <= 0 {
+			return
+		}
+	}
+}
+
 func ipKey(ip string) string {
 	return "ip:" + strings.TrimSpace(ip)
 }
 
-func userKey(username string) string {
-	return "user:" + strings.ToLower(strings.TrimSpace(username))
+func pairKey(ip, username string) string {
+	return "pair:" + strings.TrimSpace(ip) + "|" + strings.ToLower(strings.TrimSpace(username))
 }
 
-// Check verifies whether the given client IP and username are currently allowed to attempt login.
+// Check verifies whether the given client IP and (clientIP, username) pair are currently allowed to attempt login.
 func (g *LoginGuard) Check(clientIP, username string) (allowed bool, retryAfterSec int, reason string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	now := time.Now()
-	keys := []string{}
-	if strings.TrimSpace(clientIP) != "" {
-		keys = append(keys, ipKey(clientIP))
+	cleanIP := strings.TrimSpace(clientIP)
+	cleanUser := strings.ToLower(strings.TrimSpace(username))
+
+	var keys []string
+	if cleanIP != "" {
+		keys = append(keys, ipKey(cleanIP))
 	}
-	if strings.TrimSpace(username) != "" {
-		keys = append(keys, userKey(username))
+	if cleanIP != "" && cleanUser != "" {
+		keys = append(keys, pairKey(cleanIP, cleanUser))
+	} else if cleanIP == "" && cleanUser != "" {
+		keys = append(keys, pairKey("unknown", cleanUser))
 	}
 
 	for _, k := range keys {
@@ -117,7 +169,6 @@ func (g *LoginGuard) Check(clientIP, username string) (allowed bool, retryAfterS
 				}
 				return false, rem, fmt.Sprintf("Too many failed login attempts (%s locked). Retry in %d seconds or contact administrator to unban.", tr.kind, rem)
 			}
-			// Lock expired -> reset entry
 			if !tr.lockedUntil.IsZero() && !now.Before(tr.lockedUntil) {
 				delete(g.entries, k)
 			}
@@ -126,24 +177,26 @@ func (g *LoginGuard) Check(clientIP, username string) (allowed bool, retryAfterS
 	return true, 0, ""
 }
 
-// RecordFailure records a failed login attempt for clientIP and username.
+// RecordFailure records a failed login attempt for clientIP and (clientIP, username).
 func (g *LoginGuard) RecordFailure(clientIP, username string) (lockedNow bool, remainingAttempts int, retryAfterSec int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	now := time.Now()
 	remainingAttempts = g.maxFailures
+	cleanIP := strings.TrimSpace(clientIP)
+	cleanUser := strings.ToLower(strings.TrimSpace(username))
 
-	recordOne := func(key, kind, val string) {
-		if strings.TrimSpace(val) == "" {
-			return
-		}
+	recordOne := func(key, kind, displayVal, ipVal, userVal string) {
 		tr, ok := g.entries[key]
 		if !ok || now.Sub(tr.firstFail) > g.windowDuration {
+			g.ensureCapacityLocked(now)
 			tr = &loginTracker{
 				key:       key,
 				kind:      kind,
-				value:     val,
+				value:     displayVal,
+				ip:        ipVal,
+				username:  userVal,
 				firstFail: now,
 			}
 			g.entries[key] = tr
@@ -166,21 +219,56 @@ func (g *LoginGuard) RecordFailure(clientIP, username string) (lockedNow bool, r
 		}
 	}
 
-	recordOne(ipKey(clientIP), "ip", strings.TrimSpace(clientIP))
-	recordOne(userKey(username), "username", strings.ToLower(strings.TrimSpace(username)))
+	if cleanIP != "" {
+		recordOne(ipKey(cleanIP), "ip", cleanIP, cleanIP, "")
+	}
+	if cleanUser != "" {
+		ipPart := cleanIP
+		if ipPart == "" {
+			ipPart = "unknown"
+		}
+		recordOne(pairKey(ipPart, cleanUser), "ip+user", fmt.Sprintf("%s @ %s", cleanUser, ipPart), ipPart, cleanUser)
+	}
 
 	return lockedNow, remainingAttempts, retryAfterSec
 }
 
-// RecordSuccess clears failure counters upon successful authentication.
+// RecordSuccess clears failure counters ONLY for the authenticated (clientIP, username) pair,
+// and subtracts only that pair's prior failures from the IP tracker so failures against other accounts persist.
 func (g *LoginGuard) RecordSuccess(clientIP, username string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if strings.TrimSpace(clientIP) != "" {
-		delete(g.entries, ipKey(clientIP))
+
+	now := time.Now()
+	cleanIP := strings.TrimSpace(clientIP)
+	cleanUser := strings.ToLower(strings.TrimSpace(username))
+	ipPart := cleanIP
+	if ipPart == "" {
+		ipPart = "unknown"
 	}
-	if strings.TrimSpace(username) != "" {
-		delete(g.entries, userKey(username))
+
+	clearedPairFailures := 0
+	if cleanUser != "" {
+		pk := pairKey(ipPart, cleanUser)
+		if tr, ok := g.entries[pk]; ok {
+			if now.Sub(tr.firstFail) <= g.windowDuration {
+				clearedPairFailures = tr.failures
+			}
+			delete(g.entries, pk)
+		}
+	}
+
+	if cleanIP != "" && clearedPairFailures > 0 {
+		ik := ipKey(cleanIP)
+		if ipTr, ok := g.entries[ik]; ok {
+			isLocked := !ipTr.lockedUntil.IsZero() && now.Before(ipTr.lockedUntil)
+			if !isLocked {
+				ipTr.failures -= clearedPairFailures
+				if ipTr.failures <= 0 {
+					delete(g.entries, ik)
+				}
+			}
+		}
 	}
 }
 
@@ -230,7 +318,8 @@ func (g *LoginGuard) ListEntries() []models.LoginLockEntry {
 	return out
 }
 
-// Unban removes a lock/failure entry by key ("ip:1.2.3.4", "user:admin"), bare value ("1.2.3.4", "admin"), or "all".
+// Unban removes lock/failure entries by exact key ("ip:1.2.3.4", "pair:1.2.3.4|admin"),
+// bare IP ("1.2.3.4"), bare username ("admin" / "user:admin"), or "all".
 func (g *LoginGuard) Unban(target string) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -250,12 +339,33 @@ func (g *LoginGuard) Unban(target string) int {
 		delete(g.entries, t)
 		removed++
 	}
-	lower := strings.ToLower(t)
-	for _, cand := range []string{"ip:" + t, "user:" + lower} {
-		if _, ok := g.entries[cand]; ok {
-			delete(g.entries, cand)
+
+	cleanUserTarget := strings.ToLower(strings.TrimPrefix(strings.ToLower(t), "user:"))
+	cleanIPTarget := strings.TrimPrefix(t, "ip:")
+
+	for k, tr := range g.entries {
+		if tr.ip != "" && tr.ip == cleanIPTarget {
+			delete(g.entries, k)
+			removed++
+			continue
+		}
+		if tr.username != "" && tr.username == cleanUserTarget {
+			// Also adjust or clear the corresponding IP lock if all failures on that IP were for this username
+			if ik := ipKey(tr.ip); ik != "" {
+				if ipTr, hasIP := g.entries[ik]; hasIP {
+					ipTr.failures -= tr.failures
+					if ipTr.failures <= 0 {
+						delete(g.entries, ik)
+						removed++
+					} else if ipTr.failures < g.maxFailures {
+						ipTr.lockedUntil = time.Time{}
+					}
+				}
+			}
+			delete(g.entries, k)
 			removed++
 		}
 	}
+
 	return removed
 }

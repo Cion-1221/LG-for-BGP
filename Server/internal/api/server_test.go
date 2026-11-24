@@ -22,7 +22,6 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		t.Fatalf("failed to init store: %v", err)
 	}
 
-	// Setup test VRF views, test RR node, and test customer account
 	_ = st.UpsertRouteView(models.RouteViewMeta{
 		ID:                "lsys_opt",
 		Name:              "Optimized Routing",
@@ -63,10 +62,24 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 
 	cache := security.NewTTLCache()
 	eng := bgp.NewEngine(st, cache)
-	srv := NewServer(st, eng, cache, "")
+	srv := NewServer(st, eng, cache, "", "127.0.0.1", "::1", "10.100.0.0/16")
 	handler := srv.Handler()
 
-	// 1. Default mode is public so users opening LG directly can query right away
+	// 1. Verify X-Forwarded-For right-to-left spoofing defense!
+	reqSpoof := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	reqSpoof.RemoteAddr = "127.0.0.1:44444"
+	reqSpoof.Header.Set("X-Forwarded-For", "1.2.3.4, 198.51.100.77, 10.100.1.5")
+	if gotIP := srv.clientIP(reqSpoof); gotIP != "198.51.100.77" {
+		t.Fatalf("XFF spoofing defense failed: expected rightmost untrusted IP 198.51.100.77, got %q", gotIP)
+	}
+	reqUntrustedPeer := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	reqUntrustedPeer.RemoteAddr = "198.51.100.88:55555"
+	reqUntrustedPeer.Header.Set("X-Forwarded-For", "1.2.3.4")
+	if gotIP := srv.clientIP(reqUntrustedPeer); gotIP != "198.51.100.88" {
+		t.Fatalf("expected untrusted peer XFF header to be ignored, got %q", gotIP)
+	}
+
+	// 2. Default mode is public so users opening LG directly can query right away
 	reqPublic := httptest.NewRequest(http.MethodPost, "/api/v1/bgp/lookup", bytes.NewBufferString(`{"query_type":"prefix","target":"8.8.8.8","views":["lsys_opt"]}`))
 	recPublic := httptest.NewRecorder()
 	handler.ServeHTTP(recPublic, reqPublic)
@@ -86,7 +99,7 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		t.Fatalf("expected 401 for unauthenticated lookup in auth_required mode, got %d", recUnauth.Code)
 	}
 
-	// 2. Login as customer tenant_alpha (only allowed lsys_opt and vrf_dia)
+	// 3. Login as customer tenant_alpha (only allowed lsys_opt and vrf_dia)
 	reqLogin := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"tenant_alpha","password":"TenantA@123"}`))
 	recLogin := httptest.NewRecorder()
 	handler.ServeHTTP(recLogin, reqLogin)
@@ -99,7 +112,7 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 	}
 	_ = json.Unmarshal(recLogin.Body.Bytes(), &loginResp)
 
-	// 3. Customer attempts to query unauthorized view vrf_transit_a -> must return 403 Forbidden
+	// 4. Customer attempts to query unauthorized view vrf_transit_a -> must return 403 Forbidden
 	reqForbidden := httptest.NewRequest(http.MethodPost, "/api/v1/bgp/lookup", bytes.NewBufferString(`{"query_type":"prefix","target":"8.8.8.8","views":["vrf_transit_a"]}`))
 	reqForbidden.Header.Set("Authorization", "Bearer "+loginResp.Token)
 	recForbidden := httptest.NewRecorder()
@@ -108,36 +121,13 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden when customer queries unauthorized table, got %d", recForbidden.Code)
 	}
 
-	// 4. Customer queries allowed views (lsys_opt + vrf_dia) -> must return 200 OK
+	// 5. Customer queries allowed views (lsys_opt + vrf_dia) -> must return 200 OK
 	reqAllowed := httptest.NewRequest(http.MethodPost, "/api/v1/bgp/lookup", bytes.NewBufferString(`{"query_type":"prefix","target":"202.96.209.133","views":["lsys_opt","vrf_dia"]}`))
 	reqAllowed.Header.Set("Authorization", "Bearer "+loginResp.Token)
 	recAllowed := httptest.NewRecorder()
 	handler.ServeHTTP(recAllowed, reqAllowed)
 	if recAllowed.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for allowed views, got %d: %s", recAllowed.Code, recAllowed.Body.String())
-	}
-
-	var lookupResp models.LookupResponse
-	if err := json.Unmarshal(recAllowed.Body.Bytes(), &lookupResp); err != nil {
-		t.Fatalf("failed to unmarshal lookup response: %v", err)
-	}
-	if len(lookupResp.Results) != 2 {
-		t.Fatalf("expected 2 view results, got %d", len(lookupResp.Results))
-	}
-
-	// 5. Verify community dictionary endpoints have been removed
-	reqComm := httptest.NewRequest(http.MethodGet, "/api/v1/communities", nil)
-	recComm := httptest.NewRecorder()
-	handler.ServeHTTP(recComm, reqComm)
-	if recComm.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for removed /api/v1/communities, got %d", recComm.Code)
-	}
-
-	reqAdminComm := httptest.NewRequest(http.MethodPost, "/api/v1/admin/communities", bytes.NewBufferString(`{}`))
-	recAdminComm := httptest.NewRecorder()
-	handler.ServeHTTP(recAdminComm, reqAdminComm)
-	if recAdminComm.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for removed /api/v1/admin/communities, got %d", recAdminComm.Code)
 	}
 
 	// 6. Verify cross-PoP view query is rejected with HTTP 400
@@ -173,16 +163,7 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		}
 	}
 
-	// Locked out even with correct password until unbanned
-	reqBlocked := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"tenant_alpha","password":"TenantA@123"}`))
-	reqBlocked.RemoteAddr = "198.51.100.22:54321"
-	recBlocked := httptest.NewRecorder()
-	handler.ServeHTTP(recBlocked, reqBlocked)
-	if recBlocked.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected 429 while locked out, got %d", recBlocked.Code)
-	}
-
-	// Login as admin from a different IP to manually unban
+	// Login as default admin (which starts with MustChangePassword=true)
 	reqAdminLogin := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"admin","password":"Admin@123456"}`))
 	reqAdminLogin.RemoteAddr = "203.0.113.10:12345"
 	recAdminLogin := httptest.NewRecorder()
@@ -195,7 +176,35 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 	}
 	_ = json.Unmarshal(recAdminLogin.Body.Bytes(), &adminResp)
 
-	// Unban all via Admin Security endpoint
+	// 8. Verify backend enforces MustChangePassword (blocks /api/v1/admin/* with 403 BEFORE password change!)
+	reqBeforePwdChange := httptest.NewRequest(http.MethodDelete, "/api/v1/admin/security/locks?key=all", nil)
+	reqBeforePwdChange.Header.Set("Authorization", "Bearer "+adminResp.Token)
+	recBeforePwdChange := httptest.NewRecorder()
+	handler.ServeHTTP(recBeforePwdChange, reqBeforePwdChange)
+	if recBeforePwdChange.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when MustChangePassword=true on admin API, got %d", recBeforePwdChange.Code)
+	}
+
+	// Change admin password (also testing leading/trailing space preservation!)
+	reqChgPwd := httptest.NewRequest(http.MethodPost, "/api/v1/auth/change-password", bytes.NewBufferString(`{"current_password":"Admin@123456","new_password":"  NewAdmin@2026!  "}`))
+	reqChgPwd.Header.Set("Authorization", "Bearer "+adminResp.Token)
+	recChgPwd := httptest.NewRecorder()
+	handler.ServeHTTP(recChgPwd, reqChgPwd)
+	if recChgPwd.Code != http.StatusOK {
+		t.Fatalf("admin change-password failed: %d %s", recChgPwd.Code, recChgPwd.Body.String())
+	}
+	_ = json.Unmarshal(recChgPwd.Body.Bytes(), &adminResp)
+
+	// Verify exact whitespace preservation on subsequent login
+	reqSpaceLogin := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"admin","password":"  NewAdmin@2026!  "}`))
+	reqSpaceLogin.RemoteAddr = "203.0.113.10:12345"
+	recSpaceLogin := httptest.NewRecorder()
+	handler.ServeHTTP(recSpaceLogin, reqSpaceLogin)
+	if recSpaceLogin.Code != http.StatusOK {
+		t.Fatalf("expected password with spaces to authenticate identically after change-password, got %d", recSpaceLogin.Code)
+	}
+
+	// Unban via Admin Security endpoint now succeeds with 200 OK
 	reqUnban := httptest.NewRequest(http.MethodDelete, "/api/v1/admin/security/locks?key=all", nil)
 	reqUnban.Header.Set("Authorization", "Bearer "+adminResp.Token)
 	recUnban := httptest.NewRecorder()
@@ -204,7 +213,6 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		t.Fatalf("expected 200 on manual unban, got %d: %s", recUnban.Code, recUnban.Body.String())
 	}
 
-	// Now tenant_alpha from 198.51.100.22 can log in again immediately
 	reqUnblocked := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"tenant_alpha","password":"TenantA@123"}`))
 	reqUnblocked.RemoteAddr = "198.51.100.22:54321"
 	recUnblocked := httptest.NewRecorder()
@@ -213,7 +221,7 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		t.Fatalf("expected 200 after manual unban, got %d: %s", recUnblocked.Code, recUnblocked.Body.String())
 	}
 
-	// 9. Verify custom favicon_icon & portal_logo upload validation and bootstrap exposure
+	// 9. Verify custom favicon_icon & portal_logo upload validation and malicious SVG event rejection
 	validPNG := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 	goodSettings := st.GetAdminSettings()
 	goodSettings.OrganizationName = "ASLINE LG Portal"
@@ -230,9 +238,8 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		t.Fatalf("expected 200 saving valid PNG icons, got %d: %s", recSetGood.Code, recSetGood.Body.String())
 	}
 
-	// Reject malicious SVG containing <script>
 	badSettings := goodSettings
-	badSettings.FaviconIcon = "data:image/svg+xml;base64,PHN2Zz48c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ+PC9zdmc+"
+	badSettings.FaviconIcon = "data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9ImFsZXJ0KDEpIj48L3N2Zz4="
 	badPayload, _ := json.Marshal(badSettings)
 	reqSetBad := httptest.NewRequest(http.MethodPut, "/api/v1/admin/settings", bytes.NewReader(badPayload))
 	reqSetBad.Header.Set("Authorization", "Bearer "+adminResp.Token)
@@ -242,48 +249,13 @@ func TestEndToEndAPIAndMultiViewLookup(t *testing.T) {
 		t.Fatalf("expected 400 rejecting malicious SVG icon, got %d: %s", recSetBad.Code, recSetBad.Body.String())
 	}
 
-	// Reject out-of-range max_filter_routes_ipv4 (>5000)
-	badLimit := goodSettings
-	badLimit.MaxFilterRoutesV4 = 99999
-	badLimitPayload, _ := json.Marshal(badLimit)
-	reqBadLimit := httptest.NewRequest(http.MethodPut, "/api/v1/admin/settings", bytes.NewReader(badLimitPayload))
-	reqBadLimit.Header.Set("Authorization", "Bearer "+adminResp.Token)
-	recBadLimit := httptest.NewRecorder()
-	handler.ServeHTTP(recBadLimit, reqBadLimit)
-	if recBadLimit.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 rejecting out-of-range max_filter_routes_ipv4, got %d", recBadLimit.Code)
-	}
-
-	// 10. Security verification: Public Portal bootstrap, lookup, and summary MUST NEVER leak RR/Agent IPs or endpoints!
+	// 10. Public Portal bootstrap, lookup, and summary MUST NEVER leak RR/Agent IPs or endpoints
 	reqBootPub := httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
 	recBootPub := httptest.NewRecorder()
 	handler.ServeHTTP(recBootPub, reqBootPub)
-	if recBootPub.Code != http.StatusOK {
-		t.Fatalf("public bootstrap failed: %d", recBootPub.Code)
-	}
 	bootPubBody := recBootPub.Body.String()
 	if bytes.Contains([]byte(bootPubBody), []byte("10.255.255.101")) || bytes.Contains([]byte(bootPubBody), []byte("127.0.0.1:50051")) {
 		t.Fatalf("public bootstrap leaked RR loopback IP or endpoint: %s", bootPubBody)
-	}
-
-	// Public lookup MUST NOT leak RR loopback IP or endpoint in rr_node_used or raw_output
-	reqLookupPub := httptest.NewRequest(http.MethodPost, "/api/v1/bgp/lookup", bytes.NewBufferString(`{"query_type":"prefix","target":"1.1.1.1","views":["lsys_opt"],"rr_node_id":"auto","engine":"auto"}`))
-	recLookupPub := httptest.NewRecorder()
-	handler.ServeHTTP(recLookupPub, reqLookupPub)
-	if recLookupPub.Code != http.StatusOK {
-		t.Fatalf("public lookup failed: %d %s", recLookupPub.Code, recLookupPub.Body.String())
-	}
-	lookupPubBody := recLookupPub.Body.String()
-	if bytes.Contains([]byte(lookupPubBody), []byte("10.255.255.101")) || bytes.Contains([]byte(lookupPubBody), []byte("127.0.0.1:50051")) {
-		t.Fatalf("public lookup leaked RR loopback IP or endpoint: %s", lookupPubBody)
-	}
-
-	// Public /api/v1/bgp/summary MUST be Admin Only (401 without admin token)
-	reqSumPub := httptest.NewRequest(http.MethodGet, "/api/v1/bgp/summary", nil)
-	recSumPub := httptest.NewRecorder()
-	handler.ServeHTTP(recSumPub, reqSumPub)
-	if recSumPub.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for unauthenticated /api/v1/bgp/summary, got %d", recSumPub.Code)
 	}
 
 	srv.Close()

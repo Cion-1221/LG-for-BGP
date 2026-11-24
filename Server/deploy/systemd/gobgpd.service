@@ -1,0 +1,15 @@
+[Unit]
+Description=GoBGP Routing Daemon (Read-Only Route Collector)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/gobgpd -f /etc/gobgp/gobgpd.conf --api-hosts=127.0.0.1:50051
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -8,8 +8,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"lg-for-bgp/internal/models"
 )
@@ -19,14 +17,20 @@ var (
 	reCommunity = regexp.MustCompile(`^(\d{1,10}:\d{1,10}(:\d{1,10})?|route-filter-[a-zA-Z0-9\-]+|no-[a-zA-Z0-9\-]+)$`)
 
 	// Strict regex for safe AS-Path expressions: ONLY digits, spaces, _, ^, $, ., *, +, ?, [, ], -
-	// Explicitly forbids shell metacharacters (; | & ` $ ( ) \ ' " < > % \n \r)
+	// Explicitly forbids shell metacharacters (; | & ` ( ) \ ' " < > % \n \r)
 	reSafeASPath = regexp.MustCompile(`^[0-9_\^\$\.\*\+\?\[\]\s\-]{1,64}$`)
+
+	// Strips optional "AS"/"as" prefix before ASN digits even when preceded by ^ or _ (e.g. "^AS2914 AS4134$" -> "^2914 4134$")
+	reASPrefixToken = regexp.MustCompile(`(?i)(^|[\s\^_])as([0-9]+)`)
 
 	// Strict identifier format for RouteViewID (matches DB VARCHAR(64))
 	reViewID = regexp.MustCompile(`^[a-zA-Z0-9_\-]{1,64}$`)
 
 	// Shell & control characters that are unconditionally rejected at the boundary
 	forbiddenChars = ";|&`$()<>\\\"'%\n\r\t\x00"
+
+	// Allowed characters for AS-Path expressions (note: '$' is allowed as end-of-path anchor, while shell chars remain blocked)
+	forbiddenASPathChars = ";|&`()<>\\\"'%\n\r\t\x00"
 )
 
 // ValidateNoControlOrShellChars guarantees no shell injection or CLI newline injection is possible.
@@ -86,39 +90,63 @@ func ValidatePrefixOrIP(target string) (normalized string, family string, isPref
 	return addr.String(), fam, false, nil
 }
 
-// ValidateASPathOrASN validates an ASN number (e.g. "2914" or "AS2914" or "23764 4134") or safe AS-Path pattern.
+// ValidateASPathOrASN validates an ASN number (e.g. "2914", "AS2914", "^AS2914", "4134$", "23764 4134")
+// while preserving optional ^ (neighbor/entry ASN) and $ (origin ASN) anchors.
 func ValidateASPathOrASN(target string) (cleaned string, err error) {
 	target = strings.TrimSpace(target)
-	if err := ValidateNoControlOrShellChars(target); err != nil {
-		return "", err
+	if target == "" {
+		return "", errors.New("query target cannot be empty")
 	}
-	// Strip optional "AS" / "as" prefixes before digits (e.g. "AS23764 AS4134" -> "23764 4134")
-	tokens := strings.Fields(target)
-	for i, tok := range tokens {
-		upper := strings.ToUpper(tok)
-		if strings.HasPrefix(upper, "AS") && len(tok) > 2 {
-			tokens[i] = tok[2:]
-		}
-	}
-	if len(tokens) > 0 {
-		target = strings.Join(tokens, " ")
-	}
-	if target == "" || len(target) > 64 {
+	if len(target) > 64 {
 		return "", errors.New("ASN or AS-Path length must be between 1 and 64 characters")
 	}
 	for _, r := range target {
-		if r < 32 || r == 127 || strings.ContainsRune(";|&\x60()<>\\\"'%\n\r\t", r) {
+		if r < 32 || r == 127 || strings.ContainsRune(forbiddenASPathChars, r) {
 			return "", fmt.Errorf("AS-Path query contains forbidden character '%c'", r)
 		}
+	}
+	// Reject "$(...)" command substitution forms explicitly (already blocked by '(' above, kept as defense-in-depth)
+	if strings.Contains(target, "$(") {
+		return "", errors.New("forbidden metacharacter sequence in AS-Path")
+	}
+
+	target = reASPrefixToken.ReplaceAllString(target, "${1}${2}")
+	target = strings.Join(strings.Fields(target), " ")
+	if target == "" || len(target) > 64 {
+		return "", errors.New("ASN or AS-Path length must be between 1 and 64 characters")
 	}
 	if !reSafeASPath.MatchString(target) {
 		return "", errors.New("AS-Path only allows digits, spaces, and safe regex anchors (^ $ _ . * + ? [ ] -)")
 	}
-	if num, errConv := strconv.ParseUint(target, 10, 32); errConv == nil {
+	// If "$"" is used, it may only appear at the end of the expression as an origin anchor
+	if idx := strings.IndexByte(target, '$'); idx != -1 && idx != len(target)-1 {
+		return "", errors.New("'$' anchor is only allowed at the end of an AS-Path expression")
+	}
+	if idx := strings.LastIndexByte(target, '^'); idx > 0 {
+		return "", errors.New("'^' anchor is only allowed at the start of an AS-Path expression")
+	}
+
+	// Ensure at least one valid non-zero 32-bit ASN is present
+	stripped := strings.NewReplacer("^", " ", "$", " ", "_", " ").Replace(target)
+	validASNCount := 0
+	for _, tok := range strings.Fields(stripped) {
+		tok = strings.Trim(tok, ".*+?[]-")
+		if tok == "" {
+			continue
+		}
+		num, errConv := strconv.ParseUint(tok, 10, 32)
+		if errConv != nil {
+			return "", fmt.Errorf("invalid ASN token %q in AS-Path expression", tok)
+		}
 		if num == 0 {
 			return "", errors.New("ASN cannot be 0")
 		}
+		validASNCount++
 	}
+	if validASNCount == 0 {
+		return "", errors.New("AS-Path expression must contain at least one valid ASN (1..4294967295)")
+	}
+
 	return target, nil
 }
 
@@ -171,195 +199,4 @@ func ValidateRouteViews(requested []models.RouteViewID, allowed []models.RouteVi
 		result = append(result, req)
 	}
 	return result, nil
-}
-
-// TTLCache provides a fast, bounded, thread-safe in-memory cache for BGP queries
-// with automatic background expiration sweeping to prevent memory leaks.
-type cacheItem struct {
-	value     models.ViewQueryResult
-	expiresAt time.Time
-}
-
-type TTLCache struct {
-	mu        sync.RWMutex
-	items     map[string]cacheItem
-	maxItems  int
-	stopCh    chan struct{}
-	closeOnce sync.Once
-}
-
-func NewTTLCache() *TTLCache {
-	c := &TTLCache{
-		items:    make(map[string]cacheItem),
-		maxItems: 4096,
-		stopCh:   make(chan struct{}),
-	}
-	go c.gcLoop()
-	return c
-}
-
-func (c *TTLCache) Close() {
-	c.closeOnce.Do(func() {
-		close(c.stopCh)
-	})
-}
-
-func (c *TTLCache) gcLoop() {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		case now := <-ticker.C:
-			c.mu.Lock()
-			for k, item := range c.items {
-				if now.After(item.expiresAt) {
-					delete(c.items, k)
-				}
-			}
-			c.mu.Unlock()
-		}
-	}
-}
-
-func (c *TTLCache) Get(key string) (models.ViewQueryResult, bool) {
-	c.mu.RLock()
-	item, ok := c.items[key]
-	c.mu.RUnlock()
-	if !ok || time.Now().After(item.expiresAt) {
-		return models.ViewQueryResult{}, false
-	}
-	res := item.value
-	res.Cached = true
-	return res, true
-}
-
-func (c *TTLCache) Set(key string, val models.ViewQueryResult, ttl time.Duration) {
-	if ttl <= 0 {
-		return
-	}
-	now := time.Now()
-	c.mu.Lock()
-	if len(c.items) >= c.maxItems {
-		// First purge expired entries
-		for k, item := range c.items {
-			if now.After(item.expiresAt) {
-				delete(c.items, k)
-			}
-		}
-		// If still at capacity, evict the soonest-to-expire entries (up to 10%)
-		if len(c.items) >= c.maxItems {
-			evictTarget := c.maxItems / 10
-			if evictTarget < 1 {
-				evictTarget = 1
-			}
-			for i := 0; i < evictTarget && len(c.items) > 0; i++ {
-				var oldestKey string
-				var oldestExp time.Time
-				first := true
-				for k, item := range c.items {
-					if first || item.expiresAt.Before(oldestExp) {
-						oldestKey = k
-						oldestExp = item.expiresAt
-						first = false
-					}
-				}
-				if oldestKey != "" {
-					delete(c.items, oldestKey)
-				}
-			}
-		}
-	}
-	c.items[key] = cacheItem{
-		value:     val,
-		expiresAt: now.Add(ttl),
-	}
-	c.mu.Unlock()
-}
-
-func (c *TTLCache) Clear() {
-	c.mu.Lock()
-	c.items = make(map[string]cacheItem)
-	c.mu.Unlock()
-}
-
-// RateLimiter implements a sliding window per-user / per-IP request rate limiter
-// with periodic background eviction of idle keys to prevent unbounded memory growth.
-type RateLimiter struct {
-	mu        sync.Mutex
-	requests  map[string][]time.Time
-	stopCh    chan struct{}
-	closeOnce sync.Once
-}
-
-func NewRateLimiter() *RateLimiter {
-	rl := &RateLimiter{
-		requests: make(map[string][]time.Time),
-		stopCh:   make(chan struct{}),
-	}
-	go rl.gcLoop()
-	return rl
-}
-
-func (rl *RateLimiter) Close() {
-	rl.closeOnce.Do(func() {
-		close(rl.stopCh)
-	})
-}
-
-func (rl *RateLimiter) gcLoop() {
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-rl.stopCh:
-			return
-		case now := <-ticker.C:
-			cutoff := now.Add(-2 * time.Minute)
-			rl.mu.Lock()
-			for k, history := range rl.requests {
-				var active []time.Time
-				for _, t := range history {
-					if t.After(cutoff) {
-						active = append(active, t)
-					}
-				}
-				if len(active) == 0 {
-					delete(rl.requests, k)
-				} else {
-					rl.requests[k] = active
-				}
-			}
-			rl.mu.Unlock()
-		}
-	}
-}
-
-func (rl *RateLimiter) Allow(key string, limitPerMinute int) bool {
-	if limitPerMinute <= 0 {
-		limitPerMinute = 60
-	}
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	now := time.Now()
-	cutoff := now.Add(-1 * time.Minute)
-	history := rl.requests[key]
-
-	var recent []time.Time
-	for _, t := range history {
-		if t.After(cutoff) {
-			recent = append(recent, t)
-		}
-	}
-
-	if len(recent) >= limitPerMinute {
-		rl.requests[key] = recent
-		return false
-	}
-
-	recent = append(recent, now)
-	rl.requests[key] = recent
-	return true
 }

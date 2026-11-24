@@ -10,11 +10,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 concurrency:
-  group: build-and-release
+  group: build-and-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -65,14 +64,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js (Latest LTS 22)
+      - name: Set up Node.js (LTS 22)
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
       - name: Install dependencies & Build UI
         run: |
-          npm install
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
           npm run build
 
       - name: Upload Frontend Build
@@ -85,6 +88,8 @@ jobs:
     name: Package Full Deployment Bundle
     needs: [build-backend, build-frontend]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -101,7 +106,7 @@ jobs:
           name: lg-ui-dist
           path: build-out/ui/dist
 
-      - name: Assemble Release Bundles
+      - name: Assemble Release Bundles & SHA256 Checksums
         run: |
           mkdir -p release-pkg/lg-for-bgp-linux-amd64/ui
           cp build-out/bin/lg-server-linux-amd64 release-pkg/lg-for-bgp-linux-amd64/lg-server
@@ -127,6 +132,8 @@ jobs:
 
           tar -czf release-pkg/lg-for-bgp-linux-arm64.tar.gz -C release-pkg lg-for-bgp-linux-arm64
 
+          (cd release-pkg && sha256sum lg-for-bgp-linux-amd64.tar.gz lg-for-bgp-linux-arm64.tar.gz > SHA256SUMS.txt)
+
       - name: Upload Combined Deployment Package Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -134,39 +141,16 @@ jobs:
           path: |
             release-pkg/lg-for-bgp-linux-amd64.tar.gz
             release-pkg/lg-for-bgp-linux-arm64.tar.gz
+            release-pkg/SHA256SUMS.txt
 
-      - name: Replace Target Release Assets & Purge Old Workflow Runs (Keep v1.0.0 Intact)
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TARGET_TAG="v2.0.0"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            TARGET_TAG="${{ github.ref_name }}"
-          fi
-
-          # 1. Only replace an existing release matching TARGET_TAG (e.g. v2.0.0); NEVER touch or delete v1.0.0
-          if [ "${TARGET_TAG}" != "v1.0.0" ]; then
-            for rel_id in $(gh api "repos/${{ github.repository }}/releases?per_page=100" -q ".[] | select(.tag_name == \"${TARGET_TAG}\") | .id" 2>/dev/null || true); do
-              gh api -X DELETE "repos/${{ github.repository }}/releases/${rel_id}" || true
-            done
-            if [ "${{ github.ref_type }}" != "tag" ]; then
-              gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${TARGET_TAG}" 2>/dev/null || true
-            fi
-          fi
-
-          # 2. Delete all completed historical Actions workflow runs from previous commits
-          for run_id in $(gh api "repos/${{ github.repository }}/actions/runs?per_page=100" -q '.workflow_runs[] | select(.head_sha != "${{ github.sha }}" and .status == "completed") | .id' 2>/dev/null || true); do
-            gh api -X DELETE "repos/${{ github.repository }}/actions/runs/${run_id}" || true
-          done
-
-      - name: Publish GitHub Release
-        if: github.event_name != 'pull_request'
+      - name: Publish GitHub Release (Version Tags Only)
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.0.0' }}
-          name: "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.0.0' }} — Official Release"
+          tag_name: ${{ github.ref_name }}
+          name: "${{ github.ref_name }} — Official Release"
           files: |
             release-pkg/lg-for-bgp-linux-amd64.tar.gz
             release-pkg/lg-for-bgp-linux-arm64.tar.gz
+            release-pkg/SHA256SUMS.txt
           generate_release_notes: true

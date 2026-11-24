@@ -25,13 +25,13 @@ type AgentQueryRequest struct {
 	MaxIPv6    int                  `json:"max_ipv6,omitempty"`
 }
 
-// AgentQueryResponse is returned by lg-agent for POST /agent/v1/query.
+// AgentQueryResponse is returned by lg-agent for POST /agent/v1/query (pure CLI text output).
 type AgentQueryResponse struct {
-	OK            bool                  `json:"ok"`
-	MatchedPrefix string                `json:"matched_prefix"`
-	Paths         []models.BGPRoutePath `json:"paths"`
-	RawOutput     string                `json:"raw_output"`
-	Error         string                `json:"error,omitempty"`
+	OK            bool   `json:"ok"`
+	MatchedPrefix string `json:"matched_prefix"`
+	TotalPaths    int    `json:"total_paths"`
+	RawOutput     string `json:"raw_output"`
+	Error         string `json:"error,omitempty"`
 }
 
 // AgentNeighborsRequest is sent by lg-server to POST /agent/v1/neighbors.
@@ -109,7 +109,7 @@ func (e *Engine) queryRemoteAgent(
 	view models.RouteViewMeta,
 	queryType string,
 	target string,
-) ([]models.BGPRoutePath, string, string, bool) {
+) (int, string, string, bool) {
 	timeout := 6 * time.Second
 	if queryType == "aspath" || queryType == "community" {
 		timeout = 28 * time.Second
@@ -129,13 +129,13 @@ func (e *Engine) queryRemoteAgent(
 	}
 	rawBody, err := json.Marshal(payload)
 	if err != nil {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
 
 	base := strings.TrimRight(strings.TrimSpace(rrNode.Endpoint), "/")
 	req, err := http.NewRequestWithContext(qctx, http.MethodPost, base+"/agent/v1/query", bytes.NewReader(rawBody))
 	if err != nil {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if tok := strings.TrimSpace(rrNode.AgentToken); tok != "" {
@@ -144,25 +144,22 @@ func (e *Engine) queryRemoteAgent(
 
 	resp, err := agentHTTPClient.Do(req)
 	if err != nil {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
 
 	var out AgentQueryResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&out); err != nil {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
 	if !out.OK {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
-	if out.Paths == nil {
-		out.Paths = []models.BGPRoutePath{}
-	}
-	return out.Paths, out.MatchedPrefix, out.RawOutput, true
+	return out.TotalPaths, out.MatchedPrefix, out.RawOutput, true
 }
 
 func (e *Engine) queryRemoteAgentNeighbors(

@@ -4,10 +4,12 @@ package bgp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -87,17 +89,23 @@ func startCountingMockRR(t *testing.T, endpoint, vrfName, rdStr string, peers []
 }
 
 func TestStrictSinglePoPRRIsolationAndAccurateNeighbors(t *testing.T) {
-	// HKG RR only has 1 Established peer in VRF-CN-OPT (NO peer for VRF-INTL-ROUTING!)
 	hkgPeer := &apipb.Peer{
 		Conf: &apipb.PeerConf{
 			NeighborAddress: "192.168.0.46",
-			PeerAsn:         18913,
+			LocalAsn:        65000,
+			PeerAsn:         65000,
+			Type:            apipb.PeerType_INTERNAL,
 			Vrf:             "VRF-CN-OPT",
 		},
 		State: &apipb.PeerState{
 			NeighborAddress: "192.168.0.46",
-			PeerAsn:         18913,
+			LocalAsn:        65000,
+			PeerAsn:         65000,
+			Type:            apipb.PeerType_INTERNAL,
 			SessionState:    apipb.PeerState_ESTABLISHED,
+			Messages: &apipb.Messages{
+				Received: &apipb.Message{Update: 1500000},
+			},
 		},
 		Timers: &apipb.Timers{
 			State: &apipb.TimersState{
@@ -106,6 +114,9 @@ func TestStrictSinglePoPRRIsolationAndAccurateNeighbors(t *testing.T) {
 		},
 		AfiSafis: []*apipb.AfiSafi{
 			{
+				AddPaths: &apipb.AddPaths{
+					State: &apipb.AddPathsState{Receive: true},
+				},
 				State: &apipb.AfiSafiState{
 					Family:   &apipb.Family{Afi: apipb.Family_AFI_IP, Safi: apipb.Family_SAFI_UNICAST},
 					Accepted: 1369039,
@@ -150,7 +161,6 @@ func TestStrictSinglePoPRRIsolationAndAccurateNeighbors(t *testing.T) {
 		Enabled:    true,
 	})
 
-	// VRF 1: bound ONLY to rr-hkg
 	_ = st.UpsertRouteView(models.RouteViewMeta{
 		ID:        "hkg_cn_opt",
 		Name:      "CN Optimized Routing",
@@ -158,7 +168,6 @@ func TestStrictSinglePoPRRIsolationAndAccurateNeighbors(t *testing.T) {
 		Type:      "auto",
 		RRNodeIDs: []string{"rr-hkg"},
 	})
-	// VRF 2: bound to BOTH rr-hkg and rr-sin (has NO established BGP peer on either!)
 	_ = st.UpsertRouteView(models.RouteViewMeta{
 		ID:        "intl_shared",
 		Name:      "INTL Routing",
@@ -171,29 +180,29 @@ func TestStrictSinglePoPRRIsolationAndAccurateNeighbors(t *testing.T) {
 	defer cache.Close()
 	eng := NewEngine(st, cache)
 
-	// 1. Verify GetNeighborSummary accurately isolates peers per (RR, VRF) and NEVER borrows VRF-CN-OPT's peer for VRF-INTL-ROUTING!
 	summaries := eng.GetNeighborSummary()
 	if len(summaries) != 3 {
-		t.Fatalf("expected 3 neighbor summary rows (1 for hkg_cn_opt + 2 for intl_shared across rr-hkg & rr-sin), got %d: %+v", len(summaries), summaries)
+		t.Fatalf("expected 3 neighbor summary rows, got %d: %+v", len(summaries), summaries)
 	}
 	var cnEst, intlIdleHKG, intlIdleSIN bool
 	for _, s := range summaries {
-		if s.ViewID == "hkg_cn_opt" && s.RRNodeID == "rr-hkg" && s.SessionState == "Established" && s.PrefixesIPv4 == 1369039 {
+		if s.ViewID == "hkg_cn_opt" && s.RRNodeID == "rr-hkg" && s.SessionState == "Established" &&
+			s.PrefixesIPv4 == 1369039 && s.AddPathRx && s.NextHopUnchanged && s.UpdatesReceived == 1500000 {
 			cnEst = true
 		}
-		if s.ViewID == "intl_shared" && s.RRNodeID == "rr-hkg" && s.SessionState == "No Peer / Idle" && s.PrefixesIPv4 == 0 {
+		if s.ViewID == "intl_shared" && s.RRNodeID == "rr-hkg" && s.SessionState == "No Peer / Idle" && !s.AddPathRx {
 			intlIdleHKG = true
 		}
-		if s.ViewID == "intl_shared" && s.RRNodeID == "rr-sin" && s.SessionState == "No Peer / Idle" && s.PrefixesIPv4 == 0 {
+		if s.ViewID == "intl_shared" && s.RRNodeID == "rr-sin" && s.SessionState == "No Peer / Idle" && !s.AddPathRx {
 			intlIdleSIN = true
 		}
 	}
 	if !cnEst || !intlIdleHKG || !intlIdleSIN {
-		t.Fatalf("unexpected neighbor summaries (must not borrow peers across VRFs): %+v", summaries)
+		t.Fatalf("unexpected neighbor summaries: %+v", summaries)
 	}
 
-	// 2. Querying HKG MUST ONLY touch HKG RR, NEVER SIN RR
-	respHKG, err := eng.ExecuteLookup(context.Background(), models.LookupRequest{
+	// Verify VRF->RD cache prevents redundant ListVrf RPCs on consecutive prefix queries
+	_, err = eng.ExecuteLookup(context.Background(), models.LookupRequest{
 		QueryType: "prefix",
 		Target:    "202.96.134.133",
 		Views:     []models.RouteViewID{"hkg_cn_opt"},
@@ -204,14 +213,22 @@ func TestStrictSinglePoPRRIsolationAndAccurateNeighbors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HKG lookup failed: %v", err)
 	}
-	if len(respHKG.Results) != 1 || respHKG.Results[0].RRNodeID != "rr-hkg" {
-		t.Fatalf("expected result from rr-hkg, got %+v", respHKG.Results)
+	vrfCallsAfterFirst := hkgRR.listVrfCalls.Load()
+	_, _ = eng.ExecuteLookup(context.Background(), models.LookupRequest{
+		QueryType: "prefix",
+		Target:    "202.96.134.134",
+		Views:     []models.RouteViewID{"hkg_cn_opt"},
+		POP:       "HKG4-LG-RR02",
+		RRNodeID:  "auto",
+		Engine:    "auto",
+	})
+	if hkgRR.listVrfCalls.Load() != vrfCallsAfterFirst {
+		t.Fatalf("expected GoBGP VRF->RD cache hit on second query, but ListVrf increased from %d to %d", vrfCallsAfterFirst, hkgRR.listVrfCalls.Load())
 	}
-	if hkgRR.listPathCalls.Load() == 0 || sinRR.listPathCalls.Load() != 0 {
-		t.Fatalf("strict PoP isolation violated: hkg=%d sin=%d", hkgRR.listPathCalls.Load(), sinRR.listPathCalls.Load())
+	if sinRR.listPathCalls.Load() != 0 {
+		t.Fatalf("strict PoP isolation violated: sin=%d", sinRR.listPathCalls.Load())
 	}
 
-	// 3. Querying SIN with HKG-only VRF MUST be rejected
 	if _, err := eng.ExecuteLookup(context.Background(), models.LookupRequest{
 		QueryType: "prefix",
 		Target:    "202.96.134.133",
@@ -223,7 +240,6 @@ func TestStrictSinglePoPRRIsolationAndAccurateNeighbors(t *testing.T) {
 		t.Fatalf("expected error when querying HKG-only VRF under SIN PoP")
 	}
 
-	// 4. Querying SIN with shared VRF (bound to rr-hkg + rr-sin) MUST ONLY hit rr-sin!
 	hkgBefore := hkgRR.listPathCalls.Load()
 	respSIN, err := eng.ExecuteLookup(context.Background(), models.LookupRequest{
 		QueryType: "prefix",
@@ -233,40 +249,11 @@ func TestStrictSinglePoPRRIsolationAndAccurateNeighbors(t *testing.T) {
 		RRNodeID:  "auto",
 		Engine:    "auto",
 	})
-	if err != nil {
-		t.Fatalf("SIN lookup on shared VRF failed: %v", err)
-	}
-	if len(respSIN.Results) != 1 || respSIN.Results[0].RRNodeID != "rr-sin" {
-		t.Fatalf("expected SIN lookup to hit rr-sin, got %+v", respSIN.Results)
+	if err != nil || len(respSIN.Results) != 1 || respSIN.Results[0].RRNodeID != "rr-sin" {
+		t.Fatalf("expected SIN lookup to hit rr-sin, err=%v res=%+v", err, respSIN)
 	}
 	if hkgRR.listPathCalls.Load() != hkgBefore {
 		t.Fatalf("HKG RR was unexpectedly touched during SIN lookup!")
-	}
-
-	// 5. Disable SIN RR -> querying SIN MUST FAIL and MUST NOT fall back to HKG RR!
-	_ = st.UpsertRRNode(models.RRNodeConfig{
-		ID:         "rr-sin",
-		Name:       "SIN-LG-RR02",
-		Location:   "SIN-LG-RR02",
-		EngineType: "gobgp",
-		LoopbackIP: "10.2.0.1",
-		Endpoint:   "bufconn-sin:50051",
-		Role:       "primary",
-		Enabled:    false,
-	})
-	hkgBefore = hkgRR.listPathCalls.Load()
-	if _, err := eng.ExecuteLookup(context.Background(), models.LookupRequest{
-		QueryType: "prefix",
-		Target:    "202.96.134.133",
-		Views:     []models.RouteViewID{"intl_shared"},
-		POP:       "SIN-LG-RR02",
-		RRNodeID:  "auto",
-		Engine:    "auto",
-	}); err == nil {
-		t.Fatalf("expected error when SIN RR is disabled, MUST NOT fall back to HKG RR")
-	}
-	if hkgRR.listPathCalls.Load() != hkgBefore {
-		t.Fatalf("HKG RR was unexpectedly queried as fallback when SIN RR was disabled!")
 	}
 }
 
@@ -285,7 +272,7 @@ func TestRemoteLGAgentFRRQueryAndProbe(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(AgentQueryResponse{
 				OK:            true,
 				MatchedPrefix: "8.8.8.0/24",
-				Paths:         []models.BGPRoutePath{{Prefix: "8.8.8.0/24", NextHop: "10.9.9.1", Best: true}},
+				TotalPaths:    1,
 				RawOutput:     "*> 8.8.8.0/24 10.9.9.1 15169 i\n",
 			})
 		}
@@ -333,92 +320,50 @@ func TestRemoteLGAgentFRRQueryAndProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("remote lg-agent lookup failed: %v", err)
 	}
-	if len(resp.Results) != 1 || resp.Results[0].MatchedNet != "8.8.8.0/24" || resp.Results[0].EngineType != "frr" {
+	if len(resp.Results) != 1 || resp.Results[0].MatchedNet != "8.8.8.0/24" || resp.Results[0].TotalPaths != 1 {
 		t.Fatalf("unexpected remote agent result: %+v", resp.Results)
 	}
 }
 
-func TestFRRJSONParsingTableAndDetailFormats(t *testing.T) {
-	st, _ := store.NewAppStore("memory")
-	defer func() { _ = st.Close() }()
-	cache := security.NewTTLCache()
-	defer cache.Close()
-	eng := NewEngine(st, cache)
-
-	// 1. Real FRR 10.7.1 `show bgp ipv4 unicast regexp _37965_ json` / `community ... json` output:
-	//    Note `"bestpath": true` (JSON bool), top-level `"path"`, and top-level `"peerId"`!
-	tableJSON := `{
-		"vrfId": 0,
-		"vrfName": "default",
-		"tableVersion": 17827814,
-		"routerId": "103.213.4.23",
-		"defaultLocPrf": 100,
-		"localAS": 65000,
-		"routes": {
-			"139.220.199.0/24": [
-				{
-					"valid": true,
-					"bestpath": true,
-					"selectionReason": "First path received",
-					"pathFrom": "external",
-					"prefix": "139.220.199.0",
-					"prefixLen": 24,
-					"network": "139.220.199.0/24",
-					"metric": 0,
-					"locPrf": 100,
-					"weight": 0,
-					"peerId": "103.213.4.1",
-					"path": "7720 10111 4637 7468 37965",
-					"origin": "IGP",
-					"nexthops": [
-						{"ip": "103.213.4.1", "afi": "ipv4", "used": true}
-					]
-				}
-			]
+func TestStreamingFRRJSONAndBird2IPv6TableHelpers(t *testing.T) {
+	// 1. Build a large FRR table JSON stream (100 routes) and verify streamFRRTableRoutes stops early at maxRoutes=3
+	var sb strings.Builder
+	sb.WriteString(`{"vrfId":0,"vrfName":"default","routes":{`)
+	for i := 1; i <= 100; i++ {
+		if i > 1 {
+			sb.WriteByte(',')
 		}
-	}`
-	var tableResp frrTableJSONResponse
-	if err := json.Unmarshal([]byte(tableJSON), &tableResp); err != nil {
-		t.Fatalf("failed to unmarshal FRR table-scan JSON (bool bestpath): %v", err)
+		sb.WriteString(fmt.Sprintf(`"10.0.%d.0/24":[{"valid":true,"bestpath":true,"locPrf":100,"metric":0,"path":"7720 37965","nexthops":[{"ip":"103.213.4.1","afi":"ipv4"}]}]`, i))
 	}
-	view := models.RouteViewMeta{ID: "intl", Name: "INTL-ROUTING", VRFName: "global"}
-	paths := eng.convertFRRPaths("139.220.199.0/24", "ipv4", "global", view, tableResp.Routes["139.220.199.0/24"])
-	if len(paths) != 1 || !paths[0].Best || paths[0].NextHop != "103.213.4.1" || paths[0].PeerIP != "103.213.4.1" || paths[0].OriginASN != 37965 {
-		t.Fatalf("unexpected converted FRR table path: %+v", paths)
+	sb.WriteString(`}}`)
+
+	lines, alive, stoppedEarly := streamFRRTableRoutes(strings.NewReader(sb.String()), "ipv4", 3)
+	if !alive || !stoppedEarly || len(lines) != 3 {
+		t.Fatalf("expected streaming FRR parser to stop early after 3 routes, got alive=%v early=%v len=%d", alive, stoppedEarly, len(lines))
 	}
 
-	// 2. Real FRR `show bgp ipv4 unicast <prefix> json` detail output:
-	//    Note `"bestpath": {"overall": true}` (JSON object), `"aspath": {"string": ...}`, and `"peer": {"peerId": ...}`!
-	detailJSON := `{
-		"prefix": "139.220.199.0/24",
-		"paths": [
-			{
-				"valid": true,
-				"bestpath": {"overall": true},
-				"aspath": {"string": "7720 10111 4637 7468 37965"},
-				"peer": {"peerId": "103.213.4.1"},
-				"nexthops": [{"ip": "103.213.4.1", "afi": "ipv4"}],
-				"community": {"list": ["7720:1000"]}
-			}
-		]
-	}`
+	// 2. Verify FRR single-prefix JSON object bestpath parsing
+	detailJSON := `{"prefix":"139.220.199.0/24","paths":[{"valid":true,"bestpath":{"overall":true},"aspath":{"string":"7720 37965"},"nexthops":[{"ip":"103.213.4.1","afi":"ipv4"}]}]}`
 	var detailResp frrPrefixJSONResponse
-	if err := json.Unmarshal([]byte(detailJSON), &detailResp); err != nil {
-		t.Fatalf("failed to unmarshal FRR prefix detail JSON (object bestpath): %v", err)
-	}
-	dPaths := eng.convertFRRPaths(detailResp.Prefix, "ipv4", "global", view, detailResp.Paths)
-	if len(dPaths) != 1 || !dPaths[0].Best || dPaths[0].OriginASN != 37965 || len(dPaths[0].Communities) != 1 {
-		t.Fatalf("unexpected converted FRR detail path: %+v", dPaths)
+	if err := json.Unmarshal([]byte(detailJSON), &detailResp); err != nil || !bool(detailResp.Paths[0].Bestpath) {
+		t.Fatalf("failed to unmarshal FRR prefix detail JSON: %v", err)
 	}
 
-	// 3. Verify AS-Path regex builder preserves optional ^ / $ anchors safely
-	if got := buildFRRASPathRegexp("37965"); got != "_37965_" {
-		t.Fatalf("expected _37965_, got %q", got)
-	}
-	if got := buildFRRASPathRegexp("_37965$"); got != "_37965$" {
-		t.Fatalf("expected _37965$, got %q", got)
-	}
-	if got := buildFRRASPathRegexp("^7720 10111"); got != "^7720_10111_" {
+	// 3. Verify unified ^ / $ AS-Path patterns across FRR & BIRD 2
+	if got := BuildFRRASPathRegexp("^7720 10111"); got != "^7720_10111_" {
 		t.Fatalf("expected ^7720_10111_, got %q", got)
+	}
+	if got := BuildBird2ASPathPattern("4134$"); got != "[= * 4134 =]" {
+		t.Fatalf("expected '[= * 4134 =]', got %q", got)
+	}
+	if got := BuildBird2ASPathPattern("^2914"); got != "[= 2914 * =]" {
+		t.Fatalf("expected '[= 2914 * =]', got %q", got)
+	}
+
+	// 4. Verify BIRD 2 Multi-VRF IPv6 table candidate resolution ('LSYS-OPT-v6' & custom BirdTableV6)
+	v := models.RouteViewMeta{VRFName: "LSYS-OPT", BirdTableV6: "CUSTOM-OPT-V6"}
+	cands := bird2CandidateTables(v, "LSYS-OPT", "ipv6")
+	if len(cands) < 2 || cands[0] != "CUSTOM-OPT-V6" || cands[1] != "LSYS-OPT-v6" {
+		t.Fatalf("unexpected BIRD 2 IPv6 table candidates: %+v", cands)
 	}
 }

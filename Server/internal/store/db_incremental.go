@@ -3,7 +3,6 @@ package store
 
 import (
 	"encoding/json"
-	"log"
 	"strings"
 	"time"
 
@@ -139,8 +138,8 @@ func (s *AppStore) upsertRouteViewDBLocked(v models.RouteViewMeta, sortOrder int
 	var query string
 	if s.dbDriver == "sqlite" {
 		query = `
-			INSERT INTO lg_vrfs (id, name, vrf_name, type, pop, rr_node_ids, juniper_source_ipv4, description, sort_order)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO lg_vrfs (id, name, vrf_name, type, pop, rr_node_ids, juniper_source_ipv4, bird_table_v6, description, sort_order)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				name=excluded.name,
 				vrf_name=excluded.vrf_name,
@@ -148,13 +147,14 @@ func (s *AppStore) upsertRouteViewDBLocked(v models.RouteViewMeta, sortOrder int
 				pop=excluded.pop,
 				rr_node_ids=excluded.rr_node_ids,
 				juniper_source_ipv4=excluded.juniper_source_ipv4,
+				bird_table_v6=excluded.bird_table_v6,
 				description=excluded.description,
 				sort_order=excluded.sort_order
 		`
 	} else {
 		query = `
-			INSERT INTO lg_vrfs (id, name, vrf_name, type, pop, rr_node_ids, juniper_source_ipv4, description, sort_order)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO lg_vrfs (id, name, vrf_name, type, pop, rr_node_ids, juniper_source_ipv4, bird_table_v6, description, sort_order)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
 				name=VALUES(name),
 				vrf_name=VALUES(vrf_name),
@@ -162,11 +162,12 @@ func (s *AppStore) upsertRouteViewDBLocked(v models.RouteViewMeta, sortOrder int
 				pop=VALUES(pop),
 				rr_node_ids=VALUES(rr_node_ids),
 				juniper_source_ipv4=VALUES(juniper_source_ipv4),
+				bird_table_v6=VALUES(bird_table_v6),
 				description=VALUES(description),
 				sort_order=VALUES(sort_order)
 		`
 	}
-	_, err := s.db.Exec(query, string(v.ID), v.Name, vrfName, vType, vPop, string(rrIDsJSON), v.JuniperSourceIPv4, v.Description, sortOrder)
+	_, err := s.db.Exec(query, string(v.ID), v.Name, vrfName, vType, vPop, string(rrIDsJSON), v.JuniperSourceIPv4, v.BirdTableV6, v.Description, sortOrder)
 	return err
 }
 
@@ -330,7 +331,6 @@ func (s *AppStore) updateUserPasswordDBLocked(userID, passwordHash string, mustC
 	return err
 }
 
-// syncAllowedViewsDBLocked updates only public_allowed_views and user allowed_views incrementally.
 func (s *AppStore) syncAllowedViewsDBLocked() error {
 	if s.db == nil {
 		return s.persistFileLocked()
@@ -346,101 +346,4 @@ func (s *AppStore) syncAllowedViewsDBLocked() error {
 		}
 	}
 	return nil
-}
-
-// SetAuditRetention configures automatic pruning of old lg_audit_logs rows in SQLite / MySQL.
-func (s *AppStore) SetAuditRetention(retentionDays, maxRows int) {
-	if retentionDays <= 0 {
-		retentionDays = 30
-	}
-	if maxRows <= 0 {
-		maxRows = 50000
-	}
-	s.mu.Lock()
-	s.auditRetentionDays = retentionDays
-	s.auditMaxRows = maxRows
-	startLoop := !s.auditCleanerStarted && s.db != nil
-	if startLoop {
-		s.auditCleanerStarted = true
-	}
-	s.mu.Unlock()
-
-	if s.db != nil {
-		s.PruneAuditLogs()
-	}
-	if startLoop {
-		go s.auditRetentionLoop()
-	}
-}
-
-func (s *AppStore) auditRetentionLoop() {
-	ticker := time.NewTicker(6 * time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.stopCh:
-			return
-		case <-ticker.C:
-			s.PruneAuditLogs()
-		}
-	}
-}
-
-// PruneAuditLogs deletes expired or excess audit log rows from MySQL/MariaDB or SQLite
-// to keep database size bounded on long-running deployments (especially VyOS flash storage).
-func (s *AppStore) PruneAuditLogs() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.db == nil {
-		return
-	}
-	days := s.auditRetentionDays
-	if days <= 0 {
-		days = 30
-	}
-	maxRows := s.auditMaxRows
-	if maxRows <= 0 {
-		maxRows = 50000
-	}
-
-	cutoff := time.Now().AddDate(0, 0, -days)
-	res1, err := s.db.Exec(`DELETE FROM lg_audit_logs WHERE timestamp < ?`, s.dbTimeArg(cutoff))
-	var deleted int64
-	if err == nil && res1 != nil {
-		if n, e := res1.RowsAffected(); e == nil {
-			deleted += n
-		}
-	}
-
-	// Enforce max row cap (keep newest maxRows by id)
-	if s.dbDriver == "sqlite" {
-		res2, err2 := s.db.Exec(`
-			DELETE FROM lg_audit_logs
-			WHERE id NOT IN (SELECT id FROM lg_audit_logs ORDER BY id DESC LIMIT ?)
-		`, maxRows)
-		if err2 == nil && res2 != nil {
-			if n, e := res2.RowsAffected(); e == nil {
-				deleted += n
-			}
-		}
-		if deleted > 0 {
-			_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
-		}
-	} else {
-		// MySQL/MariaDB safe max-id subquery delete
-		var thresholdID int64
-		errRow := s.db.QueryRow(`SELECT id FROM lg_audit_logs ORDER BY id DESC LIMIT 1 OFFSET ?`, maxRows).Scan(&thresholdID)
-		if errRow == nil && thresholdID > 0 {
-			res2, err2 := s.db.Exec(`DELETE FROM lg_audit_logs WHERE id <= ?`, thresholdID)
-			if err2 == nil && res2 != nil {
-				if n, e := res2.RowsAffected(); e == nil {
-					deleted += n
-				}
-			}
-		}
-	}
-
-	if deleted > 0 {
-		log.Printf("[DB] Pruned %d expired/excess audit log rows (retention=%dd, max_rows=%d)", deleted, days, maxRows)
-	}
 }
